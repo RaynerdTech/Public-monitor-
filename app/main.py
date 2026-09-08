@@ -9,6 +9,12 @@ from rich.table import Table
 from app.config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    REDDIT_CLIENT_ID,
+    REDDIT_CLIENT_SECRET,
+    REDDIT_QUERIES,
+    REDDIT_SEARCH_LIMIT,
+    REDDIT_USER_AGENT,
+    REDDIT_WATCH_INTERVAL_SECONDS,
     THREADS_ACCESS_TOKEN,
     THREADS_QUERIES,
     THREADS_SEARCH_LIMIT,
@@ -32,6 +38,7 @@ from app.services.telegram import (
 from app.services.validator import ValidationResult
 from app.watchers.base import SourcePost
 from app.watchers.file import FileWatcher
+from app.watchers.reddit import RedditWatcher
 from app.watchers.threads import ThreadsWatcher
 from app.watchers.url import UrlWatcher
 from app.watchers.x import XFilteredStreamWatcher, XWatcher
@@ -58,6 +65,10 @@ def _print_results(results) -> None:
 
 def _threads_configured() -> bool:
     return bool(THREADS_ACCESS_TOKEN and THREADS_QUERIES)
+
+
+def _reddit_configured() -> bool:
+    return bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT and REDDIT_QUERIES)
 
 
 def _x_configured() -> bool:
@@ -249,6 +260,117 @@ def watch_threads(
         console.print("\n[yellow]Threads watcher stopped.[/yellow]")
 
 
+@cli.command("reddit-test")
+def reddit_test(
+    query: str | None = typer.Option(
+        None,
+        help="Override the configured Reddit search query",
+    ),
+) -> None:
+    async def run() -> None:
+        if not _reddit_configured():
+            console.print(
+                "[red]Reddit is not configured. Set REDDIT_CLIENT_ID, "
+                "REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT in .env.[/red]"
+            )
+            raise typer.Exit(1)
+
+        queries = [query] if query else REDDIT_QUERIES
+        watcher = RedditWatcher(
+            REDDIT_CLIENT_ID,
+            REDDIT_CLIENT_SECRET,
+            REDDIT_USER_AGENT,
+            queries,
+            interval_seconds=REDDIT_WATCH_INTERVAL_SECONDS,
+            limit=REDDIT_SEARCH_LIMIT,
+        )
+
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:500]
+            console.print(
+                f"[red]Reddit API returned HTTP {exc.response.status_code}.[/red] {detail}"
+            )
+            if exc.response.status_code in {401, 403}:
+                console.print(
+                    "[yellow]Check the OAuth client values and confirm Reddit approved "
+                    "this Data API use case.[/yellow]"
+                )
+            raise typer.Exit(1)
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Reddit request failed:[/red] {exc}")
+            raise typer.Exit(1)
+
+        table = Table("Source", "Posted", "URL", "Referral in text?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
+        console.print(
+            f"[green]Reddit API working. {len(posts)} recent matching posts returned.[/green]"
+        )
+
+    asyncio.run(run())
+
+
+@cli.command("watch-reddit")
+def watch_reddit(
+    interval: int = typer.Option(
+        REDDIT_WATCH_INTERVAL_SECONDS,
+        min=10,
+        help="Polling interval in seconds",
+    ),
+) -> None:
+    if not _reddit_configured():
+        console.print(
+            "[red]Reddit is not configured. Set REDDIT_CLIENT_ID, "
+            "REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT in .env.[/red]"
+        )
+        raise typer.Exit(1)
+
+    async def run() -> None:
+        watcher = RedditWatcher(
+            REDDIT_CLIENT_ID,
+            REDDIT_CLIENT_SECRET,
+            REDDIT_USER_AGENT,
+            REDDIT_QUERIES,
+            interval_seconds=interval,
+            limit=REDDIT_SEARCH_LIMIT,
+        )
+        console.print(
+            "[green]Reddit watcher started.[/green] "
+            f"Queries: {' | '.join(REDDIT_QUERIES)} | interval: {interval}s"
+        )
+        console.print(
+            "New matching Reddit posts are passed through the same validator, "
+            "dedupe and Telegram pipeline as X."
+        )
+
+        async for post in watcher.stream():
+            console.print(
+                f"[cyan]Reddit match:[/cyan] {post.source} "
+                f"{post.created_at.isoformat() if post.created_at else ''}"
+            )
+            results = await process_post(post)
+            _print_results(results)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Reddit watcher stopped.[/yellow]")
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        console.print(
+            f"[red]Reddit watcher stopped with HTTP {exc.response.status_code}.[/red] {detail}"
+        )
+        raise typer.Exit(1)
+
+
 @cli.command("x-test")
 def x_test(
     query: str | None = typer.Option(
@@ -435,6 +557,12 @@ def telegram_test() -> None:
         await send_telegram_message(
             TELEGRAM_BOT_TOKEN,
             TELEGRAM_CHAT_ID,
+    REDDIT_CLIENT_ID,
+    REDDIT_CLIENT_SECRET,
+    REDDIT_QUERIES,
+    REDDIT_SEARCH_LIMIT,
+    REDDIT_USER_AGENT,
+    REDDIT_WATCH_INTERVAL_SECONDS,
             "Referral Monitor test: Telegram alerts are working.",
         )
         console.print("[green]Telegram test sent.[/green]")
@@ -487,6 +615,9 @@ def status() -> None:
     table.add_row("Threads", "yes" if _threads_configured() else "no")
     table.add_row("Threads interval", f"{THREADS_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Threads queries", ", ".join(THREADS_QUERIES) or "-")
+    table.add_row("Reddit", "yes" if _reddit_configured() else "no")
+    table.add_row("Reddit interval", f"{REDDIT_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Reddit queries", " | ".join(REDDIT_QUERIES) or "-")
     table.add_row("X", "yes" if _x_configured() else "no")
     table.add_row("X mode", "Filtered Stream (live)")
     table.add_row("X recent query", " | ".join(X_QUERIES) or "-")

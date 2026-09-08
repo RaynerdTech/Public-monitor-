@@ -25,6 +25,25 @@ THREADS_QUERIES = [
     if query.strip()
 ]
 
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+REDDIT_USER_AGENT = os.getenv(
+    "REDDIT_USER_AGENT",
+    "windows:referral-monitor:v0.6",
+).strip()
+REDDIT_WATCH_INTERVAL_SECONDS = max(
+    10, int(os.getenv("REDDIT_WATCH_INTERVAL_SECONDS", "20"))
+)
+REDDIT_SEARCH_LIMIT = min(100, max(1, int(os.getenv("REDDIT_SEARCH_LIMIT", "100"))))
+REDDIT_QUERIES = [
+    query.strip()
+    for query in os.getenv(
+        "REDDIT_QUERIES",
+        'claude.ai/referral||"Claude referral"||"Claude guest pass"',
+    ).split("||")
+    if query.strip()
+]
+
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_WATCH_INTERVAL_SECONDS = max(10, int(os.getenv("X_WATCH_INTERVAL_SECONDS", "20")))
 X_SEARCH_LIMIT = min(100, max(10, int(os.getenv("X_SEARCH_LIMIT", "100"))))
