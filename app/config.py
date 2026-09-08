@@ -44,6 +44,24 @@ REDDIT_QUERIES = [
     if query.strip()
 ]
 
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
+YOUTUBE_WATCH_INTERVAL_SECONDS = max(
+    60, int(os.getenv("YOUTUBE_WATCH_INTERVAL_SECONDS", "1200"))
+)
+YOUTUBE_SEARCH_LIMIT = min(50, max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "50"))))
+YOUTUBE_LOOKBACK_MINUTES = max(5, int(os.getenv("YOUTUBE_LOOKBACK_MINUTES", "30")))
+# Keep this as one OR-style query by default. YouTube currently gives search.list
+# its own default bucket of 100 calls/day, so 1200s uses about 72 calls/day and leaves room for tests.
+# Separate extra queries with || only if needed.
+YOUTUBE_QUERIES = [
+    query.strip()
+    for query in os.getenv(
+        "YOUTUBE_QUERIES",
+        "claude referral|claude guest pass|claude.ai/referral",
+    ).split("||")
+    if query.strip()
+]
+
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_WATCH_INTERVAL_SECONDS = max(10, int(os.getenv("X_WATCH_INTERVAL_SECONDS", "20")))
 X_SEARCH_LIMIT = min(100, max(10, int(os.getenv("X_SEARCH_LIMIT", "100"))))

@@ -20,6 +20,11 @@ from app.config import (
     THREADS_SEARCH_LIMIT,
     THREADS_WATCH_INTERVAL_SECONDS,
     URL_WATCH_INTERVAL_SECONDS,
+    YOUTUBE_API_KEY,
+    YOUTUBE_LOOKBACK_MINUTES,
+    YOUTUBE_QUERIES,
+    YOUTUBE_SEARCH_LIMIT,
+    YOUTUBE_WATCH_INTERVAL_SECONDS,
     X_BEARER_TOKEN,
     X_QUERIES,
     X_SEARCH_LIMIT,
@@ -41,6 +46,7 @@ from app.watchers.file import FileWatcher
 from app.watchers.reddit import RedditWatcher
 from app.watchers.threads import ThreadsWatcher
 from app.watchers.url import UrlWatcher
+from app.watchers.youtube import YouTubeWatcher
 from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 
@@ -69,6 +75,10 @@ def _threads_configured() -> bool:
 
 def _reddit_configured() -> bool:
     return bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT and REDDIT_QUERIES)
+
+
+def _youtube_configured() -> bool:
+    return bool(YOUTUBE_API_KEY and YOUTUBE_QUERIES)
 
 
 def _x_configured() -> bool:
@@ -371,6 +381,227 @@ def watch_reddit(
         raise typer.Exit(1)
 
 
+@cli.command("youtube-test")
+def youtube_test(
+    query: str | None = typer.Option(
+        None,
+        help="Override the configured YouTube search query",
+    ),
+) -> None:
+    async def run() -> None:
+        if not YOUTUBE_API_KEY:
+            console.print("[red]Set YOUTUBE_API_KEY in .env first.[/red]")
+            raise typer.Exit(1)
+
+        queries = [query] if query else YOUTUBE_QUERIES
+        watcher = YouTubeWatcher(
+            YOUTUBE_API_KEY,
+            queries,
+            interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
+            max_results=YOUTUBE_SEARCH_LIMIT,
+            lookback_minutes=YOUTUBE_LOOKBACK_MINUTES,
+        )
+
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:700]
+            console.print(
+                f"[red]YouTube API returned HTTP {exc.response.status_code}.[/red] {detail}"
+            )
+            if exc.response.status_code in {400, 403}:
+                console.print(
+                    "[yellow]Check that YouTube Data API v3 is enabled, the API key is "
+                    "correct, and the key is restricted to YouTube Data API v3.[/yellow]"
+                )
+            raise typer.Exit(1)
+        except httpx.HTTPError as exc:
+            console.print(f"[red]YouTube request failed:[/red] {exc}")
+            raise typer.Exit(1)
+
+        table = Table("Source", "Posted", "URL", "Referral in text?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
+        console.print(
+            f"[green]YouTube API working. {len(posts)} recent videos returned.[/green]"
+        )
+        console.print(
+            "[yellow]Note: youtube-test uses one YouTube search request per configured query.[/yellow]"
+        )
+
+    asyncio.run(run())
+
+
+@cli.command("youtube-validate-test")
+def youtube_validate_test(
+    query: str = typer.Option(
+        "claude.ai/referral",
+        help="YouTube query to fetch before validating discovered referral links",
+    ),
+    limit: int = typer.Option(
+        5,
+        min=1,
+        max=50,
+        help="Maximum number of discovered referral links to process",
+    ),
+    telegram: bool = typer.Option(
+        False,
+        "--telegram",
+        help="Send Telegram alerts for referrals that validate as usable",
+    ),
+) -> None:
+    """Run a small real YouTube -> validator -> dedupe pipeline test."""
+
+    async def run() -> None:
+        if not YOUTUBE_API_KEY:
+            console.print("[red]Set YOUTUBE_API_KEY in .env first.[/red]")
+            raise typer.Exit(1)
+
+        watcher = YouTubeWatcher(
+            YOUTUBE_API_KEY,
+            [query],
+            interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
+            max_results=YOUTUBE_SEARCH_LIMIT,
+            lookback_minutes=YOUTUBE_LOOKBACK_MINUTES,
+        )
+
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:700]
+            console.print(
+                f"[red]YouTube API returned HTTP {exc.response.status_code}.[/red] {detail}"
+            )
+            raise typer.Exit(1)
+        except httpx.HTTPError as exc:
+            console.print(f"[red]YouTube request failed:[/red] {exc}")
+            raise typer.Exit(1)
+
+        referral_posts = [post for post in posts if extract_referral_links(post.text)]
+        if not referral_posts:
+            console.print(
+                "[yellow]YouTube search worked, but no referral-containing videos were "
+                "found in the configured lookback window.[/yellow]"
+            )
+            return
+
+        processed = 0
+        for post in referral_posts:
+            if processed >= limit:
+                break
+
+            console.print(
+                f"[cyan]YouTube validation test:[/cyan] {post.source} "
+                f"{post.created_at.isoformat() if post.created_at else ''}"
+            )
+            console.print(f"Source: {post.url or '-'}")
+
+            remaining = limit - processed
+            links = extract_referral_links(post.text)[:remaining]
+            if not links:
+                continue
+
+            # Process only the selected links so a description containing many URLs
+            # cannot exceed the requested test limit.
+            selected_post = SourcePost(
+                source=post.source,
+                text="\n".join(links),
+                url=post.url,
+                created_at=post.created_at,
+            )
+            results = await process_post(selected_post, alert_valid=telegram)
+            _print_results(results)
+            processed += len(results)
+
+        console.print(
+            f"[green]Processed {processed} YouTube referral candidate(s) through the "
+            "real validator/dedupe pipeline.[/green]"
+        )
+        if telegram:
+            console.print(
+                "[green]Telegram was enabled for this test. Only status=valid referrals "
+                "were eligible for an alert.[/green]"
+            )
+        else:
+            console.print(
+                "[yellow]Telegram was disabled for this historical test. Add --telegram "
+                "if you want valid results sent to the configured chat.[/yellow]"
+            )
+
+    asyncio.run(run())
+
+
+@cli.command("watch-youtube")
+def watch_youtube(
+    interval: int = typer.Option(
+        YOUTUBE_WATCH_INTERVAL_SECONDS,
+        min=60,
+        help="Polling interval in seconds",
+    ),
+) -> None:
+    if not _youtube_configured():
+        console.print(
+            "[red]YouTube is not configured. Set YOUTUBE_API_KEY and "
+            "YOUTUBE_QUERIES in .env.[/red]"
+        )
+        raise typer.Exit(1)
+
+    searches_per_day = (86400 / interval) * len(YOUTUBE_QUERIES)
+    estimated_search_calls = int(searches_per_day + 0.999)
+
+    async def run() -> None:
+        watcher = YouTubeWatcher(
+            YOUTUBE_API_KEY,
+            YOUTUBE_QUERIES,
+            interval_seconds=interval,
+            max_results=YOUTUBE_SEARCH_LIMIT,
+            lookback_minutes=YOUTUBE_LOOKBACK_MINUTES,
+            status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+        )
+        console.print(
+            "[green]YouTube watcher started.[/green] "
+            f"Queries: {' | '.join(YOUTUBE_QUERIES)} | interval: {interval}s"
+        )
+        console.print(
+            f"Estimated YouTube search.list usage: ~{estimated_search_calls} calls/day. "
+            "The current default search bucket is 100 calls/day."
+        )
+        if estimated_search_calls > 100:
+            console.print(
+                "[yellow]Warning: this interval/query count is above YouTube's current "
+                "default 100 search.list calls/day. Increase the interval or request more search quota.[/yellow]"
+            )
+        console.print(
+            "Recent matching videos are passed through the same referral extractor, "
+            "validator, dedupe and Telegram pipeline as X."
+        )
+
+        async for post in watcher.stream():
+            console.print(
+                f"[cyan]YouTube match:[/cyan] {post.source} "
+                f"{post.created_at.isoformat() if post.created_at else ''}"
+            )
+            results = await process_post(post)
+            _print_results(results)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]YouTube watcher stopped.[/yellow]")
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:700]
+        console.print(
+            f"[red]YouTube watcher stopped with HTTP {exc.response.status_code}.[/red] {detail}"
+        )
+        raise typer.Exit(1)
+
+
 @cli.command("x-test")
 def x_test(
     query: str | None = typer.Option(
@@ -557,12 +788,6 @@ def telegram_test() -> None:
         await send_telegram_message(
             TELEGRAM_BOT_TOKEN,
             TELEGRAM_CHAT_ID,
-    REDDIT_CLIENT_ID,
-    REDDIT_CLIENT_SECRET,
-    REDDIT_QUERIES,
-    REDDIT_SEARCH_LIMIT,
-    REDDIT_USER_AGENT,
-    REDDIT_WATCH_INTERVAL_SECONDS,
             "Referral Monitor test: Telegram alerts are working.",
         )
         console.print("[green]Telegram test sent.[/green]")
@@ -618,6 +843,9 @@ def status() -> None:
     table.add_row("Reddit", "yes" if _reddit_configured() else "no")
     table.add_row("Reddit interval", f"{REDDIT_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Reddit queries", " | ".join(REDDIT_QUERIES) or "-")
+    table.add_row("YouTube", "yes" if _youtube_configured() else "no")
+    table.add_row("YouTube interval", f"{YOUTUBE_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("YouTube queries", " | ".join(YOUTUBE_QUERIES) or "-")
     table.add_row("X", "yes" if _x_configured() else "no")
     table.add_row("X mode", "Filtered Stream (live)")
     table.add_row("X recent query", " | ".join(X_QUERIES) or "-")
