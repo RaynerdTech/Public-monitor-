@@ -78,6 +78,43 @@ def test_resolve_threads_redirect_uri_prefers_explicit_value():
     )
 
 
+
+def test_resolve_threads_redirect_uri_from_render_external_url():
+    from app.services.threads_oauth import resolve_threads_redirect_uri
+
+    assert (
+        resolve_threads_redirect_uri(
+            configured_uri="",
+            render_external_url="https://referral-monitor.onrender.com",
+        )
+        == "https://referral-monitor.onrender.com/threads/callback"
+    )
+
+
+def test_resolve_threads_redirect_uri_from_render_hostname():
+    from app.services.threads_oauth import resolve_threads_redirect_uri
+
+    assert (
+        resolve_threads_redirect_uri(
+            configured_uri="",
+            render_external_hostname="referral-monitor.onrender.com",
+        )
+        == "https://referral-monitor.onrender.com/threads/callback"
+    )
+
+
+def test_explicit_redirect_uri_beats_render_and_railway():
+    from app.services.threads_oauth import resolve_threads_redirect_uri
+
+    assert (
+        resolve_threads_redirect_uri(
+            configured_uri="https://monitor.example.com/threads/callback",
+            render_external_url="https://ignored.onrender.com",
+            railway_public_domain="ignored.up.railway.app",
+        )
+        == "https://monitor.example.com/threads/callback"
+    )
+
 def test_resolve_threads_server_port_uses_platform_port():
     from app.services.threads_oauth import resolve_threads_server_port
 

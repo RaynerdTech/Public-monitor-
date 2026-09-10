@@ -389,8 +389,6 @@ def threads_oauth_server(
         THREADS_APP_ID,
         redirect_uri,
         THREADS_OAUTH_SCOPES,
-    THREADS_REDIRECT_URI,
-    THREADS_OAUTH_START_KEY,
         state,
     )
     result: dict[str, str | bool] = {"done": False, "message": ""}
@@ -515,6 +513,8 @@ def threads_web_server() -> None:
     try:
         redirect_uri = resolve_threads_redirect_uri(
             configured_uri=THREADS_REDIRECT_URI,
+            render_external_url=os.getenv("RENDER_EXTERNAL_URL", ""),
+            render_external_hostname=os.getenv("RENDER_EXTERNAL_HOSTNAME", ""),
             railway_public_domain=os.getenv("RAILWAY_PUBLIC_DOMAIN", ""),
         )
         port = resolve_threads_server_port(
@@ -747,14 +747,6 @@ def threads_test(
         queries = [query] if query else THREADS_QUERIES
         watcher = ThreadsWatcher(
             token,
-    THREADS_APP_ID,
-    THREADS_APP_SECRET,
-    THREADS_OAUTH_HOST,
-    THREADS_OAUTH_PORT,
-    THREADS_OAUTH_SCOPES,
-    THREADS_REDIRECT_URI,
-    THREADS_OAUTH_START_KEY,
-    THREADS_TOKEN_FILE,
             queries,
             interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
             limit=THREADS_SEARCH_LIMIT,
@@ -802,16 +794,13 @@ def watch_threads(
         raise typer.Exit(1)
 
     async def run() -> None:
+        token = _threads_current_token(refresh_if_needed=True)
+        if not token:
+            console.print("[red]Threads token is unavailable or expired.[/red]")
+            raise typer.Exit(1)
+
         watcher = ThreadsWatcher(
-            THREADS_ACCESS_TOKEN,
-    THREADS_APP_ID,
-    THREADS_APP_SECRET,
-    THREADS_OAUTH_HOST,
-    THREADS_OAUTH_PORT,
-    THREADS_OAUTH_SCOPES,
-    THREADS_REDIRECT_URI,
-    THREADS_OAUTH_START_KEY,
-    THREADS_TOKEN_FILE,
+            token,
             THREADS_QUERIES,
             interval_seconds=interval,
             limit=THREADS_SEARCH_LIMIT,

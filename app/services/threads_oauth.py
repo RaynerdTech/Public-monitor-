@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import httpx
 
@@ -264,16 +264,37 @@ def refresh_token_record(
 
 
 def resolve_threads_redirect_uri(
-    *, configured_uri: str = "", railway_public_domain: str = ""
+    *,
+    configured_uri: str = "",
+    render_external_url: str = "",
+    render_external_hostname: str = "",
+    railway_public_domain: str = "",
 ) -> str:
-    """Resolve the public HTTPS callback URL for hosted Threads OAuth."""
+    """Resolve the public HTTPS callback URL for hosted Threads OAuth.
+
+    An explicitly configured URI always wins. On Render, the platform-provided
+    external URL/hostname is used automatically. Railway remains as a backwards-
+    compatible fallback for existing deployments.
+    """
     uri = configured_uri.strip()
+
+    if not uri and render_external_url.strip():
+        uri = render_external_url.strip().rstrip("/") + "/threads/callback"
+
+    if not uri and render_external_hostname.strip():
+        hostname = render_external_hostname.strip().strip("/")
+        uri = f"https://{hostname}/threads/callback"
+
     if not uri and railway_public_domain.strip():
-        uri = f"https://{railway_public_domain.strip().strip('/')}" + "/threads/callback"
+        hostname = railway_public_domain.strip().strip("/")
+        uri = f"https://{hostname}/threads/callback"
+
     if not uri:
         return ""
-    if not uri.startswith("https://"):
-        raise ValueError("Threads redirect URI must use HTTPS")
+
+    parsed = urlparse(uri)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError("Threads redirect URI must be a complete HTTPS URL")
     return uri
 
 
