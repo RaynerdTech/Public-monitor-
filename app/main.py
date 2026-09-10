@@ -1,5 +1,9 @@
 import asyncio
+import html
+import os
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import typer
@@ -14,6 +18,17 @@ from app.config import (
     EXA_PAGE_FETCH_TIMEOUT_SECONDS,
     EXA_LOOKBACK_MINUTES,
     EXA_API_KEY,
+    PODCAST_DISCOVERY_INTERVAL_SECONDS,
+    PODCAST_DISCOVERY_QUERIES,
+    PODCAST_INDEX_API_KEY,
+    PODCAST_INDEX_API_SECRET,
+    PODCAST_INDEX_RECENT_MAX,
+    PODCAST_INDEX_USER_AGENT,
+    PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
+    PODCAST_LOOKBACK_MINUTES,
+    PODCAST_RSS_INTERVAL_SECONDS,
+    PODCAST_RSS_MAX_FEEDS,
+    PODCAST_SOURCE_REGISTRY,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_IDS,
     REDDIT_CLIENT_ID,
@@ -23,6 +38,14 @@ from app.config import (
     REDDIT_USER_AGENT,
     REDDIT_WATCH_INTERVAL_SECONDS,
     THREADS_ACCESS_TOKEN,
+    THREADS_APP_ID,
+    THREADS_APP_SECRET,
+    THREADS_OAUTH_HOST,
+    THREADS_OAUTH_PORT,
+    THREADS_OAUTH_SCOPES,
+    THREADS_REDIRECT_URI,
+    THREADS_OAUTH_START_KEY,
+    THREADS_TOKEN_FILE,
     THREADS_QUERIES,
     THREADS_SEARCH_LIMIT,
     THREADS_WATCH_INTERVAL_SECONDS,
@@ -45,6 +68,19 @@ from app.config import (
 from app.core.database import get_recent_referrals, get_referral_by_code, init_db, update_validation
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.services.pipeline import process_post
+from app.services.threads_oauth import (
+    build_threads_authorization_url,
+    create_token_record,
+    exchange_code_for_short_lived_token,
+    exchange_for_long_lived_token,
+    fetch_threads_identity,
+    load_threads_token,
+    new_oauth_state,
+    refresh_token_record,
+    save_threads_token,
+    resolve_threads_redirect_uri,
+    resolve_threads_server_port,
+)
 from app.services.telegram import (
     format_referral_alert,
     get_telegram_updates,
@@ -54,6 +90,7 @@ from app.services.telegram import (
 from app.services.validator import ValidationResult, validate_referral
 from app.watchers.base import SourcePost
 from app.watchers.file import FileWatcher
+from app.watchers.podcast import PodcastWatcher
 from app.watchers.reddit import RedditWatcher
 from app.watchers.threads import ThreadsWatcher
 from app.watchers.url import UrlWatcher
@@ -81,8 +118,35 @@ def _print_results(results) -> None:
     console.print(table)
 
 
+def _threads_token_record():
+    return load_threads_token(THREADS_TOKEN_FILE)
+
+
+def _threads_current_token(*, refresh_if_needed: bool = False) -> str:
+    if THREADS_ACCESS_TOKEN:
+        return THREADS_ACCESS_TOKEN
+
+    record = _threads_token_record()
+    if not record or record.is_expired():
+        return ""
+
+    if refresh_if_needed and record.needs_refresh() and THREADS_APP_SECRET:
+        try:
+            record = refresh_token_record(record=record)
+            save_threads_token(THREADS_TOKEN_FILE, record)
+        except Exception:
+            # Keep using the still-valid token if a refresh attempt fails.
+            pass
+
+    return record.access_token
+
+
 def _threads_configured() -> bool:
-    return bool(THREADS_ACCESS_TOKEN and THREADS_QUERIES)
+    return bool(_threads_current_token() and THREADS_QUERIES)
+
+
+def _threads_oauth_configured() -> bool:
+    return bool(THREADS_APP_ID and THREADS_APP_SECRET and THREADS_OAUTH_SCOPES)
 
 
 def _reddit_configured() -> bool:
@@ -99,6 +163,10 @@ def _x_configured() -> bool:
 
 def _web_configured() -> bool:
     return bool(EXA_API_KEY and EXA_QUERIES)
+
+
+def _podcast_configured() -> bool:
+    return bool(PODCAST_INDEX_API_KEY and PODCAST_INDEX_API_SECRET)
 
 
 @cli.command("scan")
@@ -289,6 +357,377 @@ def watch_url(
         console.print("\n[yellow]Watcher stopped.[/yellow]")
 
 
+@cli.command("threads-oauth-server")
+def threads_oauth_server(
+    redirect_uri: str = typer.Option(
+        ...,
+        "--redirect-uri",
+        help="Exact public HTTPS callback URL registered in the Threads app",
+    ),
+    port: int = typer.Option(
+        THREADS_OAUTH_PORT,
+        min=1,
+        max=65535,
+        help="Local callback server port exposed through the HTTPS tunnel",
+    ),
+) -> None:
+    """Run the local Threads OAuth callback and save a long-lived token."""
+    if not _threads_oauth_configured():
+        console.print(
+            "[red]Set THREADS_APP_ID and THREADS_APP_SECRET in .env first.[/red]"
+        )
+        raise typer.Exit(1)
+
+    parsed = urlparse(redirect_uri)
+    if parsed.scheme != "https" or not parsed.netloc:
+        console.print("[red]--redirect-uri must be a complete HTTPS URL.[/red]")
+        raise typer.Exit(1)
+
+    callback_path = parsed.path or "/threads/callback"
+    state = new_oauth_state()
+    auth_url = build_threads_authorization_url(
+        THREADS_APP_ID,
+        redirect_uri,
+        THREADS_OAUTH_SCOPES,
+    THREADS_REDIRECT_URI,
+    THREADS_OAUTH_START_KEY,
+        state,
+    )
+    result: dict[str, str | bool] = {"done": False, "message": ""}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:  # noqa: A003
+            return
+
+        def _send_html(self, status: int, title: str, body: str) -> None:
+            content = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                f"<title>{html.escape(title)}</title></head>"
+                "<body style='font-family:system-ui;max-width:720px;margin:60px auto;padding:0 20px'>"
+                f"<h2>{html.escape(title)}</h2><p>{html.escape(body)}</p></body></html>"
+            ).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+        def do_GET(self) -> None:  # noqa: N802
+            request_url = urlparse(self.path)
+            if request_url.path == "/":
+                self._send_html(200, "Referral Monitor", "Threads OAuth callback is running.")
+                return
+            if request_url.path != callback_path:
+                self._send_html(404, "Not found", "This is not the configured Threads callback path.")
+                return
+
+            params = parse_qs(request_url.query)
+            returned_state = (params.get("state") or [""])[0]
+            error = (params.get("error") or params.get("error_message") or [""])[0]
+            code = (params.get("code") or [""])[0]
+
+            if error:
+                result["done"] = True
+                result["message"] = f"Threads authorization failed: {error}"
+                self._send_html(400, "Threads authorization failed", str(error))
+                return
+            if not returned_state or returned_state != state:
+                result["done"] = True
+                result["message"] = "Threads OAuth state check failed"
+                self._send_html(400, "Invalid OAuth state", "The authorization response could not be verified.")
+                return
+            if not code:
+                result["done"] = True
+                result["message"] = "Threads did not return an authorization code"
+                self._send_html(400, "Missing authorization code", "Threads did not return an authorization code.")
+                return
+
+            try:
+                short_token, short_user_id = exchange_code_for_short_lived_token(
+                    app_id=THREADS_APP_ID,
+                    app_secret=THREADS_APP_SECRET,
+                    code=code,
+                    redirect_uri=redirect_uri,
+                )
+                long_token, expires_in, token_type = exchange_for_long_lived_token(
+                    short_lived_token=short_token,
+                    app_secret=THREADS_APP_SECRET,
+                )
+                user_id, username = fetch_threads_identity(access_token=long_token)
+                record = create_token_record(
+                    access_token=long_token,
+                    user_id=user_id or short_user_id,
+                    username=username,
+                    token_type=token_type,
+                    expires_in=expires_in,
+                )
+                save_threads_token(THREADS_TOKEN_FILE, record)
+                result["done"] = True
+                result["message"] = (
+                    f"Authorized @{username}" if username else "Threads authorization completed"
+                )
+                self._send_html(
+                    200,
+                    "Threads connected",
+                    "Authorization completed successfully. You can close this page now.",
+                )
+            except Exception as exc:  # callback must return a useful browser response
+                result["done"] = True
+                result["message"] = f"Token exchange failed: {type(exc).__name__}: {exc}"
+                self._send_html(500, "Token exchange failed", str(exc))
+
+    server = ThreadingHTTPServer((THREADS_OAUTH_HOST, port), Handler)
+    server.timeout = 1
+
+    console.print(f"[green]Threads OAuth callback listening locally on http://{THREADS_OAUTH_HOST}:{port}[/green]")
+    console.print("Add this exact URL to the client's Threads app Redirect Callback URLs:")
+    console.print(f"[bold cyan]{redirect_uri}[/bold cyan]")
+    console.print("\nAfter Meta saves that callback, send/open this authorization URL:")
+    console.print(f"[bold cyan]{auth_url}[/bold cyan]")
+    console.print("\nWaiting for the Threads authorization callback. Ctrl+C to stop.")
+
+    try:
+        while not result["done"]:
+            server.handle_request()
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Threads OAuth server stopped.[/yellow]")
+        return
+    finally:
+        server.server_close()
+
+    message = str(result["message"])
+    if message.startswith("Authorized") or message == "Threads authorization completed":
+        console.print(f"[green]{message}.[/green]")
+        console.print(
+            f"Long-lived token saved locally to {THREADS_TOKEN_FILE}. The token was not printed."
+        )
+        console.print("Run: python -m app.main threads-test")
+    else:
+        console.print(f"[red]{message}[/red]")
+        raise typer.Exit(1)
+
+
+@cli.command("threads-web-server")
+def threads_web_server() -> None:
+    """Run a persistent public Threads OAuth web service for hosted deployments."""
+    oauth_configured = _threads_oauth_configured()
+
+    try:
+        redirect_uri = resolve_threads_redirect_uri(
+            configured_uri=THREADS_REDIRECT_URI,
+            railway_public_domain=os.getenv("RAILWAY_PUBLIC_DOMAIN", ""),
+        )
+        port = resolve_threads_server_port(
+            port_env=os.getenv("PORT", ""),
+            fallback=THREADS_OAUTH_PORT,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    pending_states: dict[str, datetime] = {}
+
+    def _prune_states() -> None:
+        cutoff = datetime.now(timezone.utc).timestamp() - 15 * 60
+        stale = [
+            state
+            for state, created in pending_states.items()
+            if created.timestamp() < cutoff
+        ]
+        for state in stale:
+            pending_states.pop(state, None)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args) -> None:  # noqa: A003
+            return
+
+        def _send_html(self, status: int, title: str, body: str) -> None:
+            content = (
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                f"<title>{html.escape(title)}</title></head>"
+                "<body style='font-family:system-ui;max-width:720px;margin:60px auto;padding:0 20px'>"
+                f"<h2>{html.escape(title)}</h2><p>{html.escape(body)}</p></body></html>"
+            ).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
+
+        def _redirect(self, location: str) -> None:
+            self.send_response(302)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+        def do_GET(self) -> None:  # noqa: N802
+            request_url = urlparse(self.path)
+
+            if request_url.path in {"/", "/health"}:
+                self._send_html(200, "Referral Monitor", "Threads OAuth service is running.")
+                return
+
+            if request_url.path == "/threads/authorize":
+                if not oauth_configured:
+                    self._send_html(
+                        503,
+                        "Threads OAuth not ready",
+                        "The Threads App ID/secret and OAuth scopes have not been configured yet.",
+                    )
+                    return
+                if not redirect_uri:
+                    self._send_html(
+                        503,
+                        "Threads OAuth not ready",
+                        "The public redirect URI has not been configured yet.",
+                    )
+                    return
+
+                params = parse_qs(request_url.query)
+                supplied_key = (params.get("key") or [""])[0]
+                if THREADS_OAUTH_START_KEY and supplied_key != THREADS_OAUTH_START_KEY:
+                    self._send_html(403, "Forbidden", "Invalid authorization start key.")
+                    return
+
+                _prune_states()
+                state = new_oauth_state()
+                pending_states[state] = datetime.now(timezone.utc)
+                auth_url = build_threads_authorization_url(
+                    THREADS_APP_ID,
+                    redirect_uri,
+                    THREADS_OAUTH_SCOPES,
+                    state,
+                )
+                self._redirect(auth_url)
+                return
+
+            if request_url.path != "/threads/callback":
+                self._send_html(404, "Not found", "Unknown endpoint.")
+                return
+
+            if not oauth_configured:
+                self._send_html(
+                    503,
+                    "Threads OAuth not ready",
+                    "The Threads App ID/secret and OAuth scopes have not been configured yet.",
+                )
+                return
+            if not redirect_uri:
+                self._send_html(
+                    503,
+                    "Threads OAuth not ready",
+                    "The public redirect URI has not been configured yet.",
+                )
+                return
+
+            params = parse_qs(request_url.query)
+            returned_state = (params.get("state") or [""])[0]
+            error = (params.get("error") or params.get("error_message") or [""])[0]
+            code = (params.get("code") or [""])[0]
+
+            if error:
+                self._send_html(400, "Threads authorization failed", str(error))
+                return
+
+            _prune_states()
+            if not returned_state or returned_state not in pending_states:
+                self._send_html(
+                    400,
+                    "Invalid OAuth state",
+                    "The authorization response could not be verified. Start authorization again.",
+                )
+                return
+            pending_states.pop(returned_state, None)
+
+            if not code:
+                self._send_html(
+                    400,
+                    "Missing authorization code",
+                    "Threads did not return an authorization code.",
+                )
+                return
+
+            try:
+                short_token, short_user_id = exchange_code_for_short_lived_token(
+                    app_id=THREADS_APP_ID,
+                    app_secret=THREADS_APP_SECRET,
+                    code=code,
+                    redirect_uri=redirect_uri,
+                )
+                long_token, expires_in, token_type = exchange_for_long_lived_token(
+                    short_lived_token=short_token,
+                    app_secret=THREADS_APP_SECRET,
+                )
+                user_id, username = fetch_threads_identity(access_token=long_token)
+                record = create_token_record(
+                    access_token=long_token,
+                    user_id=user_id or short_user_id,
+                    username=username,
+                    token_type=token_type,
+                    expires_in=expires_in,
+                )
+                save_threads_token(THREADS_TOKEN_FILE, record)
+                display_user = f"@{username}" if username else "Threads account"
+                self._send_html(
+                    200,
+                    "Threads connected",
+                    f"{display_user} was authorized successfully. You can close this page.",
+                )
+                console.print(f"[green]Threads OAuth completed for {display_user}.[/green]")
+            except Exception as exc:
+                console.print(f"[red]Threads token exchange failed: {type(exc).__name__}: {exc}[/red]")
+                self._send_html(
+                    500,
+                    "Token exchange failed",
+                    "Threads authorization reached the server, but token exchange failed.",
+                )
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    console.print(f"[green]Threads web service listening on 0.0.0.0:{port}[/green]")
+    if not oauth_configured:
+        console.print(
+            "[yellow]Threads App ID/secret not configured yet. The health endpoint is live, but authorization stays disabled until those variables are added.[/yellow]"
+        )
+    if redirect_uri:
+        console.print(f"Callback URL: [cyan]{redirect_uri}[/cyan]")
+        auth_path = "/threads/authorize"
+        if THREADS_OAUTH_START_KEY:
+            auth_path += f"?key={THREADS_OAUTH_START_KEY}"
+        console.print(f"Authorization path: [cyan]{auth_path}[/cyan]")
+    else:
+        console.print(
+            "[yellow]No public callback URL yet. Generate the hosting domain, then set THREADS_REDIRECT_URI and redeploy.[/yellow]"
+        )
+
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Threads web service stopped.[/yellow]")
+    finally:
+        server.server_close()
+
+
+@cli.command("threads-token-status")
+def threads_token_status() -> None:
+    """Show stored Threads token metadata without printing the token."""
+    if THREADS_ACCESS_TOKEN:
+        console.print("[green]THREADS_ACCESS_TOKEN is configured directly in .env.[/green]")
+        return
+
+    record = _threads_token_record()
+    if not record:
+        console.print(f"[yellow]No stored Threads token found at {THREADS_TOKEN_FILE}.[/yellow]")
+        raise typer.Exit(1)
+
+    table = Table("Field", "Value")
+    table.add_row("User", f"@{record.username}" if record.username else "-")
+    table.add_row("User ID", record.user_id or "-")
+    table.add_row("Expires", record.expires_at or "unknown")
+    table.add_row("Expired", "yes" if record.is_expired() else "no")
+    table.add_row("Stored at", THREADS_TOKEN_FILE)
+    console.print(table)
+
+
 @cli.command("threads-test")
 def threads_test(
     query: str | None = typer.Option(
@@ -297,13 +736,25 @@ def threads_test(
     ),
 ) -> None:
     async def run() -> None:
-        if not THREADS_ACCESS_TOKEN:
-            console.print("[red]Set THREADS_ACCESS_TOKEN in .env first.[/red]")
+        token = _threads_current_token(refresh_if_needed=True)
+        if not token:
+            console.print(
+                "[red]Threads token is not configured. Run threads-oauth-server or set "
+                "THREADS_ACCESS_TOKEN.[/red]"
+            )
             raise typer.Exit(1)
 
         queries = [query] if query else THREADS_QUERIES
         watcher = ThreadsWatcher(
-            THREADS_ACCESS_TOKEN,
+            token,
+    THREADS_APP_ID,
+    THREADS_APP_SECRET,
+    THREADS_OAUTH_HOST,
+    THREADS_OAUTH_PORT,
+    THREADS_OAUTH_SCOPES,
+    THREADS_REDIRECT_URI,
+    THREADS_OAUTH_START_KEY,
+    THREADS_TOKEN_FILE,
             queries,
             interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
             limit=THREADS_SEARCH_LIMIT,
@@ -353,6 +804,14 @@ def watch_threads(
     async def run() -> None:
         watcher = ThreadsWatcher(
             THREADS_ACCESS_TOKEN,
+    THREADS_APP_ID,
+    THREADS_APP_SECRET,
+    THREADS_OAUTH_HOST,
+    THREADS_OAUTH_PORT,
+    THREADS_OAUTH_SCOPES,
+    THREADS_REDIRECT_URI,
+    THREADS_OAUTH_START_KEY,
+    THREADS_TOKEN_FILE,
             THREADS_QUERIES,
             interval_seconds=interval,
             limit=THREADS_SEARCH_LIMIT,
@@ -727,6 +1186,17 @@ def web_test(
         queries = [query] if query else EXA_QUERIES
         watcher = ExaWebWatcher(
             EXA_API_KEY,
+    PODCAST_DISCOVERY_INTERVAL_SECONDS,
+    PODCAST_DISCOVERY_QUERIES,
+    PODCAST_INDEX_API_KEY,
+    PODCAST_INDEX_API_SECRET,
+    PODCAST_INDEX_RECENT_MAX,
+    PODCAST_INDEX_USER_AGENT,
+    PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
+    PODCAST_LOOKBACK_MINUTES,
+    PODCAST_RSS_INTERVAL_SECONDS,
+    PODCAST_RSS_MAX_FEEDS,
+    PODCAST_SOURCE_REGISTRY,
             queries,
             interval_seconds=EXA_WATCH_INTERVAL_SECONDS,
             max_results=EXA_SEARCH_LIMIT,
@@ -794,6 +1264,17 @@ def watch_web(
     async def run() -> None:
         watcher = ExaWebWatcher(
             EXA_API_KEY,
+    PODCAST_DISCOVERY_INTERVAL_SECONDS,
+    PODCAST_DISCOVERY_QUERIES,
+    PODCAST_INDEX_API_KEY,
+    PODCAST_INDEX_API_SECRET,
+    PODCAST_INDEX_RECENT_MAX,
+    PODCAST_INDEX_USER_AGENT,
+    PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
+    PODCAST_LOOKBACK_MINUTES,
+    PODCAST_RSS_INTERVAL_SECONDS,
+    PODCAST_RSS_MAX_FEEDS,
+    PODCAST_SOURCE_REGISTRY,
             EXA_QUERIES,
             interval_seconds=interval,
             max_results=EXA_SEARCH_LIMIT,
@@ -825,6 +1306,123 @@ def watch_web(
         asyncio.run(run())
     except KeyboardInterrupt:
         console.print("\n[yellow]Web watcher stopped.[/yellow]")
+
+
+@cli.command("podcast-test")
+def podcast_test() -> None:
+    """Verify Podcast Index auth and run one discovery/recent/RSS cycle."""
+
+    async def run() -> None:
+        if not _podcast_configured():
+            console.print(
+                "[red]Set PODCAST_INDEX_API_KEY and PODCAST_INDEX_API_SECRET in .env first.[/red]"
+            )
+            raise typer.Exit(1)
+
+        watcher = PodcastWatcher(
+            PODCAST_INDEX_API_KEY,
+            PODCAST_INDEX_API_SECRET,
+            PODCAST_INDEX_USER_AGENT,
+            interval_seconds=PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
+            recent_max=PODCAST_INDEX_RECENT_MAX,
+            lookback_minutes=PODCAST_LOOKBACK_MINUTES,
+            discovery_queries=PODCAST_DISCOVERY_QUERIES,
+            discovery_interval_seconds=PODCAST_DISCOVERY_INTERVAL_SECONDS,
+            rss_interval_seconds=PODCAST_RSS_INTERVAL_SECONDS,
+            rss_max_feeds=PODCAST_RSS_MAX_FEEDS,
+            source_registry_path=PODCAST_SOURCE_REGISTRY,
+            status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+        )
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:700]
+            console.print(
+                f"[red]Podcast Index returned HTTP {exc.response.status_code}.[/red] {detail}"
+            )
+            if exc.response.status_code in {401, 403}:
+                console.print(
+                    "[yellow]Check the Podcast Index API key/secret and system clock.[/yellow]"
+                )
+            raise typer.Exit(1)
+        except httpx.HTTPError as exc:
+            console.print(f"[red]Podcast request failed:[/red] {type(exc).__name__}: {exc}")
+            raise typer.Exit(1)
+
+        table = Table("Source", "Published", "URL", "Referral in notes?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
+        console.print(
+            "[green]Podcast Index authentication/discovery worked.[/green] "
+            f"{len(posts)} referral-containing podcast episode(s) found in this cycle."
+        )
+        console.print(
+            f"RSS source registry: [cyan]{PODCAST_SOURCE_REGISTRY}[/cyan]. "
+            "Matching/useful feeds are kept there automatically for direct polling."
+        )
+
+    asyncio.run(run())
+
+
+@cli.command("watch-podcasts")
+def watch_podcasts(
+    interval: int = typer.Option(
+        PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
+        min=30,
+        help="Podcast Index recent-data polling interval in seconds",
+    ),
+) -> None:
+    if not _podcast_configured():
+        console.print(
+            "[red]Podcasts are not configured. Set PODCAST_INDEX_API_KEY and "
+            "PODCAST_INDEX_API_SECRET in .env.[/red]"
+        )
+        raise typer.Exit(1)
+
+    async def run() -> None:
+        watcher = PodcastWatcher(
+            PODCAST_INDEX_API_KEY,
+            PODCAST_INDEX_API_SECRET,
+            PODCAST_INDEX_USER_AGENT,
+            interval_seconds=interval,
+            recent_max=PODCAST_INDEX_RECENT_MAX,
+            lookback_minutes=PODCAST_LOOKBACK_MINUTES,
+            discovery_queries=PODCAST_DISCOVERY_QUERIES,
+            discovery_interval_seconds=PODCAST_DISCOVERY_INTERVAL_SECONDS,
+            rss_interval_seconds=PODCAST_RSS_INTERVAL_SECONDS,
+            rss_max_feeds=PODCAST_RSS_MAX_FEEDS,
+            source_registry_path=PODCAST_SOURCE_REGISTRY,
+            status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+        )
+        console.print(
+            "[green]Podcast/RSS watcher started.[/green] "
+            f"Podcast Index recent-data interval: {interval}s | direct RSS interval: "
+            f"{PODCAST_RSS_INTERVAL_SECONDS}s"
+        )
+        console.print(
+            "Podcast Index watches newly indexed episodes globally. Relevant Claude feeds "
+            "are also discovered and monitored directly by RSS. Referral-containing show "
+            "notes go through the shared validator/dedupe/Telegram pipeline."
+        )
+
+        async for post in watcher.stream():
+            console.print(
+                f"[cyan]Podcast referral match:[/cyan] {post.source} "
+                f"{post.created_at.isoformat() if post.created_at else ''}"
+            )
+            results = await process_post(post)
+            _print_results(results)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Podcast/RSS watcher stopped.[/yellow]")
 
 
 @cli.command("x-test")
@@ -1075,6 +1673,7 @@ def telegram_status() -> None:
             f"X live stream: {'ready' if X_BEARER_TOKEN else 'not configured'}",
             f"YouTube monitor: {'ready' if YOUTUBE_API_KEY else 'not configured'} ({YOUTUBE_WATCH_INTERVAL_SECONDS}s)",
             f"Web / Exa monitor: {'ready' if EXA_API_KEY else 'not configured'} ({EXA_WATCH_INTERVAL_SECONDS}s)",
+            f"Podcast / RSS monitor: {'ready' if _podcast_configured() else 'not configured'} ({PODCAST_INDEX_WATCH_INTERVAL_SECONDS}s)",
             f"Validator browser fallback: {'ready' if VALIDATOR_BROWSER_FALLBACK_ENABLED else 'off'}",
             f"Reddit: {'ready' if _reddit_configured() else 'pending / not configured'}",
             f"Threads: {'ready' if _threads_configured() else 'pending / not configured'}",
@@ -1110,6 +1709,11 @@ def status() -> None:
             f"{VALIDATOR_BROWSER_CHANNEL or 'chromium'} ({'headless' if VALIDATOR_BROWSER_HEADLESS else 'visible'})",
         )
     table.add_row("Threads", "yes" if _threads_configured() else "no")
+    table.add_row("Threads OAuth app", "yes" if _threads_oauth_configured() else "no")
+    table.add_row(
+        "Threads token source",
+        ".env" if THREADS_ACCESS_TOKEN else (THREADS_TOKEN_FILE if _threads_token_record() else "-")
+    )
     table.add_row("Threads interval", f"{THREADS_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Threads queries", ", ".join(THREADS_QUERIES) or "-")
     table.add_row("Reddit", "yes" if _reddit_configured() else "no")
@@ -1122,6 +1726,10 @@ def status() -> None:
     table.add_row("Web interval", f"{EXA_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Web search type", EXA_SEARCH_TYPE)
     table.add_row("Web queries", " | ".join(EXA_QUERIES) or "-")
+    table.add_row("Podcast / RSS", "yes" if _podcast_configured() else "no")
+    table.add_row("Podcast Index interval", f"{PODCAST_INDEX_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Podcast RSS interval", f"{PODCAST_RSS_INTERVAL_SECONDS}s")
+    table.add_row("Podcast discovery queries", " | ".join(PODCAST_DISCOVERY_QUERIES) or "-")
     table.add_row("X", "yes" if _x_configured() else "no")
     table.add_row("X mode", "Filtered Stream (live)")
     table.add_row("X recent query", " | ".join(X_QUERIES) or "-")

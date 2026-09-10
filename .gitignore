@@ -4,3 +4,5 @@ __pycache__/
 *.db
 
 .referral-browser-profile/
+podcast_sources.json
+.threads-token.json

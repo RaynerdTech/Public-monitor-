@@ -44,6 +44,21 @@ VALIDATOR_BROWSER_NAVIGATION_TIMEOUT_SECONDS = max(
 URL_WATCH_INTERVAL_SECONDS = max(5, int(os.getenv("URL_WATCH_INTERVAL_SECONDS", "30")))
 
 THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "").strip()
+THREADS_APP_ID = os.getenv("THREADS_APP_ID", "").strip()
+THREADS_APP_SECRET = os.getenv("THREADS_APP_SECRET", "").strip()
+THREADS_TOKEN_FILE = os.getenv("THREADS_TOKEN_FILE", ".threads-token.json").strip() or ".threads-token.json"
+THREADS_OAUTH_HOST = os.getenv("THREADS_OAUTH_HOST", "127.0.0.1").strip() or "127.0.0.1"
+THREADS_OAUTH_PORT = max(1, min(65535, int(os.getenv("THREADS_OAUTH_PORT", "8765"))))
+THREADS_REDIRECT_URI = os.getenv("THREADS_REDIRECT_URI", "").strip()
+THREADS_OAUTH_START_KEY = os.getenv("THREADS_OAUTH_START_KEY", "").strip()
+THREADS_OAUTH_SCOPES = [
+    scope.strip()
+    for scope in os.getenv(
+        "THREADS_OAUTH_SCOPES",
+        "threads_basic,threads_keyword_search",
+    ).split(",")
+    if scope.strip()
+]
 THREADS_WATCH_INTERVAL_SECONDS = max(
     10, int(os.getenv("THREADS_WATCH_INTERVAL_SECONDS", "30"))
 )
@@ -138,4 +153,41 @@ X_STREAM_RULES = [
 ]
 X_STREAM_RECONNECT_SECONDS = max(
     1, int(os.getenv("X_STREAM_RECONNECT_SECONDS", "5"))
+)
+
+PODCAST_INDEX_API_KEY = os.getenv("PODCAST_INDEX_API_KEY", "").strip()
+PODCAST_INDEX_API_SECRET = os.getenv("PODCAST_INDEX_API_SECRET", "").strip()
+PODCAST_INDEX_USER_AGENT = (
+    os.getenv("PODCAST_INDEX_USER_AGENT", "ReferralMonitor/0.9").strip()
+    or "ReferralMonitor/0.9"
+)
+PODCAST_INDEX_WATCH_INTERVAL_SECONDS = max(
+    30, int(os.getenv("PODCAST_INDEX_WATCH_INTERVAL_SECONDS", "120"))
+)
+PODCAST_INDEX_RECENT_MAX = max(
+    1, int(os.getenv("PODCAST_INDEX_RECENT_MAX", "1000"))
+)
+PODCAST_LOOKBACK_MINUTES = max(
+    5, int(os.getenv("PODCAST_LOOKBACK_MINUTES", "30"))
+)
+PODCAST_DISCOVERY_INTERVAL_SECONDS = max(
+    300, int(os.getenv("PODCAST_DISCOVERY_INTERVAL_SECONDS", "21600"))
+)
+PODCAST_DISCOVERY_QUERIES = [
+    query.strip()
+    for query in os.getenv(
+        "PODCAST_DISCOVERY_QUERIES",
+        "Claude||Claude Code",
+    ).split("||")
+    if query.strip()
+]
+PODCAST_RSS_INTERVAL_SECONDS = max(
+    30, int(os.getenv("PODCAST_RSS_INTERVAL_SECONDS", "120"))
+)
+PODCAST_RSS_MAX_FEEDS = max(
+    1, int(os.getenv("PODCAST_RSS_MAX_FEEDS", "100"))
+)
+PODCAST_SOURCE_REGISTRY = (
+    os.getenv("PODCAST_SOURCE_REGISTRY", "podcast_sources.json").strip()
+    or "podcast_sources.json"
 )
