@@ -1,10 +1,10 @@
 from collections.abc import Awaitable, Callable
 
-from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS
 from app.core.database import init_db, save_referral, update_validation
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.core.models import ReferralCandidate
-from app.services.telegram import format_referral_alert, send_telegram_message
+from app.services.telegram import format_referral_alert, send_telegram_message_all
 from app.services.validator import ValidationResult, validate_referral
 from app.watchers.base import SourcePost
 
@@ -52,13 +52,13 @@ async def process_post(
             alert_valid
             and validation.status == "valid"
             and TELEGRAM_BOT_TOKEN
-            and TELEGRAM_CHAT_ID
+            and TELEGRAM_CHAT_IDS
         ):
             alert = format_referral_alert(candidate, validation)
             try:
-                await send_telegram_message(
+                await send_telegram_message_all(
                     TELEGRAM_BOT_TOKEN,
-                    TELEGRAM_CHAT_ID,
+                    TELEGRAM_CHAT_IDS,
                     alert,
                 )
             except Exception:

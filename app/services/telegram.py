@@ -19,6 +19,25 @@ async def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None
         response.raise_for_status()
 
 
+async def send_telegram_message_all(
+    bot_token: str, chat_ids: list[str], text: str
+) -> tuple[list[str], dict[str, str]]:
+    """Send one message to every configured Telegram destination.
+
+    Returns (successful_chat_ids, failures_by_chat_id). One broken destination
+    must not prevent the others from receiving an alert.
+    """
+    successful: list[str] = []
+    failures: dict[str, str] = {}
+    for chat_id in chat_ids:
+        try:
+            await send_telegram_message(bot_token, chat_id, text)
+            successful.append(chat_id)
+        except Exception as exc:
+            failures[chat_id] = type(exc).__name__
+    return successful, failures
+
+
 async def get_telegram_updates(bot_token: str) -> list[dict]:
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
     async with httpx.AsyncClient(timeout=10) as client:

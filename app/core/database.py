@@ -159,6 +159,23 @@ async def update_validation(
         await db.commit()
 
 
+async def get_referral_by_code(referral_code: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT id, referral_url, referral_code, source, source_url,
+                   post_created_at, detected_at, status, campaign, validation_message
+            FROM referrals
+            WHERE referral_code = ?
+            LIMIT 1
+            """,
+            (referral_code,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+
 async def get_recent_referrals(limit: int = 20) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

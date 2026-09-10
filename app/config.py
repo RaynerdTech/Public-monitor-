@@ -4,11 +4,43 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+def _telegram_chat_ids() -> list[str]:
+    # TELEGRAM_CHAT_IDS is the canonical setting. Keep TELEGRAM_CHAT_ID as a
+    # backwards-compatible fallback, including comma-separated values.
+    raw = os.getenv("TELEGRAM_CHAT_IDS") or os.getenv("TELEGRAM_CHAT_ID", "")
+    return [chat_id.strip() for chat_id in raw.split(",") if chat_id.strip()]
+
+
+TELEGRAM_CHAT_IDS = _telegram_chat_ids()
+TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
 DATABASE_PATH = os.getenv("DATABASE_PATH", "referrals.db").strip() or "referrals.db"
 VALIDATION_TIMEOUT_SECONDS = float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "10"))
 VALIDATION_RETRIES = max(1, int(os.getenv("VALIDATION_RETRIES", "2")))
+VALIDATOR_BROWSER_FALLBACK_ENABLED = _env_bool(
+    "VALIDATOR_BROWSER_FALLBACK_ENABLED", True
+)
+VALIDATOR_BROWSER_HEADLESS = _env_bool("VALIDATOR_BROWSER_HEADLESS", False)
+VALIDATOR_BROWSER_PROFILE_DIR = (
+    os.getenv("VALIDATOR_BROWSER_PROFILE_DIR", ".referral-browser-profile").strip()
+    or ".referral-browser-profile"
+)
+VALIDATOR_BROWSER_CHANNEL = os.getenv("VALIDATOR_BROWSER_CHANNEL", "chrome").strip()
+VALIDATOR_BROWSER_CHALLENGE_WAIT_SECONDS = max(
+    5, int(os.getenv("VALIDATOR_BROWSER_CHALLENGE_WAIT_SECONDS", "120"))
+)
+VALIDATOR_BROWSER_NAVIGATION_TIMEOUT_SECONDS = max(
+    5, int(os.getenv("VALIDATOR_BROWSER_NAVIGATION_TIMEOUT_SECONDS", "30"))
+)
 URL_WATCH_INTERVAL_SECONDS = max(5, int(os.getenv("URL_WATCH_INTERVAL_SECONDS", "30")))
 
 THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "").strip()
@@ -58,6 +90,27 @@ YOUTUBE_QUERIES = [
     for query in os.getenv(
         "YOUTUBE_QUERIES",
         "claude referral|claude guest pass|claude.ai/referral",
+    ).split("||")
+    if query.strip()
+]
+
+
+EXA_API_KEY = os.getenv("EXA_API_KEY", "").strip()
+EXA_WATCH_INTERVAL_SECONDS = max(
+    60, int(os.getenv("EXA_WATCH_INTERVAL_SECONDS", "1200"))
+)
+EXA_SEARCH_LIMIT = min(100, max(1, int(os.getenv("EXA_SEARCH_LIMIT", "10"))))
+EXA_LOOKBACK_MINUTES = max(5, int(os.getenv("EXA_LOOKBACK_MINUTES", "60")))
+EXA_SEARCH_TYPE = os.getenv("EXA_SEARCH_TYPE", "fast").strip() or "fast"
+EXA_PAGE_FETCH_TIMEOUT_SECONDS = max(
+    3, int(os.getenv("EXA_PAGE_FETCH_TIMEOUT_SECONDS", "12"))
+)
+# Keep one broad query by default to control cost. Separate extra queries with ||.
+EXA_QUERIES = [
+    query.strip()
+    for query in os.getenv(
+        "EXA_QUERIES",
+        'recent public webpages containing a Claude referral URL starting with https://claude.ai/referral/ or a Claude Code guest pass',
     ).split("||")
     if query.strip()
 ]

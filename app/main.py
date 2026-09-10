@@ -7,8 +7,15 @@ from rich.console import Console
 from rich.table import Table
 
 from app.config import (
+    EXA_WATCH_INTERVAL_SECONDS,
+    EXA_SEARCH_TYPE,
+    EXA_SEARCH_LIMIT,
+    EXA_QUERIES,
+    EXA_PAGE_FETCH_TIMEOUT_SECONDS,
+    EXA_LOOKBACK_MINUTES,
+    EXA_API_KEY,
     TELEGRAM_BOT_TOKEN,
-    TELEGRAM_CHAT_ID,
+    TELEGRAM_CHAT_IDS,
     REDDIT_CLIENT_ID,
     REDDIT_CLIENT_SECRET,
     REDDIT_QUERIES,
@@ -20,6 +27,9 @@ from app.config import (
     THREADS_SEARCH_LIMIT,
     THREADS_WATCH_INTERVAL_SECONDS,
     URL_WATCH_INTERVAL_SECONDS,
+    VALIDATOR_BROWSER_FALLBACK_ENABLED,
+    VALIDATOR_BROWSER_HEADLESS,
+    VALIDATOR_BROWSER_CHANNEL,
     YOUTUBE_API_KEY,
     YOUTUBE_LOOKBACK_MINUTES,
     YOUTUBE_QUERIES,
@@ -32,21 +42,23 @@ from app.config import (
     X_STREAM_RULES,
     X_WATCH_INTERVAL_SECONDS,
 )
-from app.core.database import get_recent_referrals, init_db
-from app.core.extractor import extract_referral_links
+from app.core.database import get_recent_referrals, get_referral_by_code, init_db, update_validation
+from app.core.extractor import extract_referral_code, extract_referral_links
 from app.services.pipeline import process_post
 from app.services.telegram import (
     format_referral_alert,
     get_telegram_updates,
     send_telegram_message,
+    send_telegram_message_all,
 )
-from app.services.validator import ValidationResult
+from app.services.validator import ValidationResult, validate_referral
 from app.watchers.base import SourcePost
 from app.watchers.file import FileWatcher
 from app.watchers.reddit import RedditWatcher
 from app.watchers.threads import ThreadsWatcher
 from app.watchers.url import UrlWatcher
 from app.watchers.youtube import YouTubeWatcher
+from app.watchers.web import ExaWebWatcher
 from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 
@@ -83,6 +95,10 @@ def _youtube_configured() -> bool:
 
 def _x_configured() -> bool:
     return bool(X_BEARER_TOKEN and X_QUERIES)
+
+
+def _web_configured() -> bool:
+    return bool(EXA_API_KEY and EXA_QUERIES)
 
 
 @cli.command("scan")
@@ -134,13 +150,102 @@ def simulate(
         _print_results(results)
 
         if telegram and results:
-            if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+            if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
                 console.print("[red]Telegram is not configured in .env.[/red]")
                 raise typer.Exit(1)
             candidate, validation, _ = results[0]
             alert = format_referral_alert(candidate, validation, simulated=True)
-            await send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, alert)
+            await send_telegram_message_all(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, alert)
             console.print("[green]Telegram test alert sent.[/green]")
+
+    asyncio.run(run())
+
+
+@cli.command("validator-test")
+def validator_test(
+    referral: str = typer.Argument(..., help="Claude referral URL or referral code"),
+) -> None:
+    """Validate one referral directly, using browser fallback if Cloudflare challenges it."""
+
+    async def run() -> None:
+        code = extract_referral_code(referral) or referral.strip().strip("/")
+        if not code:
+            console.print("[red]Could not extract a referral code.[/red]")
+            raise typer.Exit(1)
+
+        console.print(f"Validating referral code: [cyan]{code}[/cyan]")
+        result = await validate_referral(code)
+        table = Table("Status", "Campaign", "Method", "Message")
+        table.add_row(
+            result.status,
+            result.campaign or "-",
+            result.method,
+            result.message or "-",
+        )
+        console.print(table)
+
+    asyncio.run(run())
+
+
+@cli.command("revalidate")
+def revalidate(
+    referral: str = typer.Argument(..., help="Stored Claude referral URL or referral code"),
+    telegram: bool = typer.Option(
+        False,
+        "--telegram",
+        help="Send Telegram if the stored referral now validates as usable",
+    ),
+) -> None:
+    """Revalidate an existing database referral without being blocked by dedupe."""
+
+    async def run() -> None:
+        code = extract_referral_code(referral) or referral.strip().strip("/")
+        row = await get_referral_by_code(code)
+        if not row:
+            console.print(f"[red]Referral code {code} is not stored in the local database.[/red]")
+            raise typer.Exit(1)
+
+        result = await validate_referral(code)
+        await update_validation(
+            referral_code=code,
+            status=result.status,
+            campaign=result.campaign,
+            validation_message=result.message,
+        )
+
+        table = Table("Referral", "Status", "Campaign", "Method", "Message")
+        table.add_row(
+            row["referral_url"],
+            result.status,
+            result.campaign or "-",
+            result.method,
+            result.message or "-",
+        )
+        console.print(table)
+
+        if telegram and result.status == "valid":
+            if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+                console.print("[red]Telegram is not configured in .env.[/red]")
+                raise typer.Exit(1)
+
+            def parse_dt(value):
+                return datetime.fromisoformat(value) if value else None
+
+            from app.core.models import ReferralCandidate
+
+            candidate = ReferralCandidate(
+                referral_url=row["referral_url"],
+                referral_code=row["referral_code"],
+                source=row["source"],
+                source_url=row["source_url"],
+                post_created_at=parse_dt(row["post_created_at"]),
+                detected_at=parse_dt(row["detected_at"]) or datetime.now(timezone.utc),
+            )
+            alert = format_referral_alert(candidate, result)
+            await send_telegram_message_all(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, alert)
+            console.print("[green]Valid referral sent to Telegram.[/green]")
+        elif telegram:
+            console.print("[yellow]Telegram was not sent because the referral is not valid.[/yellow]")
 
     asyncio.run(run())
 
@@ -602,6 +707,126 @@ def watch_youtube(
         raise typer.Exit(1)
 
 
+@cli.command("web-test")
+def web_test(
+    query: str | None = typer.Option(
+        None,
+        help="Override the configured Exa web search query",
+    ),
+    lookback_minutes: int = typer.Option(
+        EXA_LOOKBACK_MINUTES,
+        min=5,
+        help="Ignore dated results older than this many minutes",
+    ),
+) -> None:
+    async def run() -> None:
+        if not EXA_API_KEY:
+            console.print("[red]Set EXA_API_KEY in .env first.[/red]")
+            raise typer.Exit(1)
+
+        queries = [query] if query else EXA_QUERIES
+        watcher = ExaWebWatcher(
+            EXA_API_KEY,
+            queries,
+            interval_seconds=EXA_WATCH_INTERVAL_SECONDS,
+            max_results=EXA_SEARCH_LIMIT,
+            lookback_minutes=lookback_minutes,
+            search_type=EXA_SEARCH_TYPE,
+            page_fetch_timeout_seconds=EXA_PAGE_FETCH_TIMEOUT_SECONDS,
+        )
+
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:700]
+            console.print(
+                f"[red]Exa API returned HTTP {exc.response.status_code}.[/red] {detail}"
+            )
+            if exc.response.status_code in {401, 402, 403}:
+                console.print(
+                    "[yellow]Check the Exa API key and account billing/credits.[/yellow]"
+                )
+            raise typer.Exit(1)
+        except httpx.HTTPError as exc:
+            detail = str(exc).strip() or "no additional message"
+            console.print(
+                f"[red]Exa request failed ({type(exc).__name__}):[/red] {detail}"
+            )
+            console.print(
+                "[yellow]Transient Exa/network failures are retried automatically up to 3 times. "
+                "If this repeats, check Exa dashboard status/credits and try again.[/yellow]"
+            )
+            raise typer.Exit(1)
+
+        table = Table("Source", "Published", "URL", "Referral in page?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
+        console.print(
+            f"[green]Exa web search working. {len(posts)} fresh candidate pages returned.[/green]"
+        )
+
+    asyncio.run(run())
+
+
+@cli.command("watch-web")
+def watch_web(
+    interval: int = typer.Option(
+        EXA_WATCH_INTERVAL_SECONDS,
+        min=60,
+        help="Broad web search interval in seconds",
+    ),
+) -> None:
+    if not _web_configured():
+        console.print(
+            "[red]Web discovery is not configured. Set EXA_API_KEY and EXA_QUERIES in .env.[/red]"
+        )
+        raise typer.Exit(1)
+
+    searches_per_day = (86400 / interval) * len(EXA_QUERIES)
+    estimated_search_calls = int(searches_per_day + 0.999)
+
+    async def run() -> None:
+        watcher = ExaWebWatcher(
+            EXA_API_KEY,
+            EXA_QUERIES,
+            interval_seconds=interval,
+            max_results=EXA_SEARCH_LIMIT,
+            lookback_minutes=EXA_LOOKBACK_MINUTES,
+            search_type=EXA_SEARCH_TYPE,
+            page_fetch_timeout_seconds=EXA_PAGE_FETCH_TIMEOUT_SECONDS,
+            status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+        )
+        console.print(
+            "[green]Broad web watcher started.[/green] "
+            f"Queries: {' | '.join(EXA_QUERIES)} | interval: {interval}s"
+        )
+        console.print(
+            f"Estimated Exa Search usage: ~{estimated_search_calls} searches/day. "
+            "Candidate pages are fetched directly and passed through the shared validator."
+        )
+
+        async for post in watcher.stream():
+            referrals = extract_referral_links(post.text)
+            if referrals:
+                console.print(
+                    f"[cyan]Web referral candidate:[/cyan] {post.url or '-'} "
+                    f"{post.created_at.isoformat() if post.created_at else ''}"
+                )
+            results = await process_post(post)
+            _print_results(results)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Web watcher stopped.[/yellow]")
+
+
 @cli.command("x-test")
 def x_test(
     query: str | None = typer.Option(
@@ -780,17 +1005,21 @@ def recent(limit: int = typer.Option(20, min=1, max=200)) -> None:
 @cli.command("telegram-test")
 def telegram_test() -> None:
     async def run() -> None:
-        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
             console.print(
-                "[red]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env first.[/red]"
+                "[red]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in .env first.[/red]"
             )
             raise typer.Exit(1)
-        await send_telegram_message(
+        successful, failures = await send_telegram_message_all(
             TELEGRAM_BOT_TOKEN,
-            TELEGRAM_CHAT_ID,
+            TELEGRAM_CHAT_IDS,
             "Referral Monitor test: Telegram alerts are working.",
         )
-        console.print("[green]Telegram test sent.[/green]")
+        console.print(
+            f"[green]Telegram test sent to {len(successful)}/{len(TELEGRAM_CHAT_IDS)} configured chat(s).[/green]"
+        )
+        if failures:
+            console.print(f"[yellow]Failed chats: {', '.join(failures)}[/yellow]")
 
     asyncio.run(run())
 
@@ -830,13 +1059,56 @@ def telegram_chats() -> None:
     asyncio.run(run())
 
 
+@cli.command("telegram-status")
+def telegram_status() -> None:
+    """Send a concise configuration snapshot to every Telegram destination."""
+
+    async def run() -> None:
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+            console.print(
+                "[red]Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS in .env first.[/red]"
+            )
+            raise typer.Exit(1)
+
+        lines = [
+            "Referral Monitor status",
+            f"X live stream: {'ready' if X_BEARER_TOKEN else 'not configured'}",
+            f"YouTube monitor: {'ready' if YOUTUBE_API_KEY else 'not configured'} ({YOUTUBE_WATCH_INTERVAL_SECONDS}s)",
+            f"Web / Exa monitor: {'ready' if EXA_API_KEY else 'not configured'} ({EXA_WATCH_INTERVAL_SECONDS}s)",
+            f"Validator browser fallback: {'ready' if VALIDATOR_BROWSER_FALLBACK_ENABLED else 'off'}",
+            f"Reddit: {'ready' if _reddit_configured() else 'pending / not configured'}",
+            f"Threads: {'ready' if _threads_configured() else 'pending / not configured'}",
+            f"Telegram destinations: {len(TELEGRAM_CHAT_IDS)}",
+            f"Status generated: {datetime.now(timezone.utc).isoformat()}",
+        ]
+        successful, failures = await send_telegram_message_all(
+            TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS, "\n".join(lines)
+        )
+        console.print(
+            f"[green]Status sent to {len(successful)}/{len(TELEGRAM_CHAT_IDS)} configured chat(s).[/green]"
+        )
+        if failures:
+            console.print(f"[yellow]Failed chats: {', '.join(failures)}[/yellow]")
+
+    asyncio.run(run())
+
+
 @cli.command("status")
 def status() -> None:
     table = Table("Component", "Configured")
     table.add_row(
         "Telegram",
-        "yes" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else "no",
+        f"yes ({len(TELEGRAM_CHAT_IDS)} chat(s))" if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS else "no",
     )
+    table.add_row(
+        "Validator browser fallback",
+        "yes" if VALIDATOR_BROWSER_FALLBACK_ENABLED else "no",
+    )
+    if VALIDATOR_BROWSER_FALLBACK_ENABLED:
+        table.add_row(
+            "Validator browser",
+            f"{VALIDATOR_BROWSER_CHANNEL or 'chromium'} ({'headless' if VALIDATOR_BROWSER_HEADLESS else 'visible'})",
+        )
     table.add_row("Threads", "yes" if _threads_configured() else "no")
     table.add_row("Threads interval", f"{THREADS_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Threads queries", ", ".join(THREADS_QUERIES) or "-")
@@ -846,6 +1118,10 @@ def status() -> None:
     table.add_row("YouTube", "yes" if _youtube_configured() else "no")
     table.add_row("YouTube interval", f"{YOUTUBE_WATCH_INTERVAL_SECONDS}s")
     table.add_row("YouTube queries", " | ".join(YOUTUBE_QUERIES) or "-")
+    table.add_row("Web / Exa", "yes" if _web_configured() else "no")
+    table.add_row("Web interval", f"{EXA_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Web search type", EXA_SEARCH_TYPE)
+    table.add_row("Web queries", " | ".join(EXA_QUERIES) or "-")
     table.add_row("X", "yes" if _x_configured() else "no")
     table.add_row("X mode", "Filtered Stream (live)")
     table.add_row("X recent query", " | ".join(X_QUERIES) or "-")
