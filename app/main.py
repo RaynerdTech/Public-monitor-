@@ -1,6 +1,7 @@
 import asyncio
 import html
 import os
+import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -1569,6 +1570,246 @@ def watch_x() -> None:
             f"[red]X live stream stopped with HTTP {exc.response.status_code}.[/red] {detail}"
         )
         raise typer.Exit(1)
+
+
+async def _run_configured_monitor_stream(
+    name: str,
+    watcher,
+    pipeline_lock: asyncio.Lock,
+    *,
+    retry_seconds: int = 30,
+    before_stream=None,
+) -> None:
+    """Keep one configured watcher alive without taking down the other watchers."""
+    backoff = max(5, retry_seconds)
+
+    while True:
+        try:
+            if before_stream is not None:
+                await before_stream()
+
+            async for post in watcher.stream():
+                console.print(
+                    f"[cyan]{name} match:[/cyan] {post.source} "
+                    f"{post.created_at.isoformat() if post.created_at else ''}"
+                )
+                async with pipeline_lock:
+                    results = await process_post(post)
+                _print_results(results)
+
+            # stream() implementations are intended to be infinite. If one ever
+            # returns, recreate/retry it rather than ending the hosted process.
+            raise RuntimeError(f"{name} watcher stream ended unexpectedly")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            console.print(
+                f"[yellow]{name} watcher error: {type(exc).__name__}: {exc}. "
+                f"Retrying in {backoff}s.[/yellow]"
+            )
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+
+
+async def _run_threads_hosted(pipeline_lock: asyncio.Lock) -> None:
+    """Wait for OAuth, then monitor Threads and transparently pick up refreshed tokens."""
+    last_wait_message = False
+
+    while True:
+        token = _threads_current_token(refresh_if_needed=True)
+        if not token:
+            if not last_wait_message:
+                console.print(
+                    "[yellow]Threads watcher waiting for OAuth authorization/token.[/yellow]"
+                )
+                last_wait_message = True
+            await asyncio.sleep(15)
+            continue
+
+        last_wait_message = False
+        watcher = ThreadsWatcher(
+            token,
+            THREADS_QUERIES,
+            interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
+            limit=THREADS_SEARCH_LIMIT,
+        )
+        console.print(
+            "[green]Threads watcher active.[/green] "
+            f"Queries: {', '.join(THREADS_QUERIES)} | interval: {THREADS_WATCH_INTERVAL_SECONDS}s"
+        )
+
+        try:
+            while True:
+                current_token = _threads_current_token(refresh_if_needed=True)
+                if not current_token:
+                    break
+                if current_token != token:
+                    # Token was refreshed/replaced; rebuild the watcher with it.
+                    break
+
+                posts = await watcher.fetch()
+                for post in posts:
+                    console.print(
+                        f"[cyan]Threads match:[/cyan] {post.source} "
+                        f"{post.created_at.isoformat() if post.created_at else ''}"
+                    )
+                    async with pipeline_lock:
+                        results = await process_post(post)
+                    _print_results(results)
+                await asyncio.sleep(THREADS_WATCH_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            console.print(
+                f"[yellow]Threads watcher error: {type(exc).__name__}: {exc}. "
+                "Retrying automatically.[/yellow]"
+            )
+            await asyncio.sleep(30)
+
+
+@cli.command("watch-all")
+def watch_all() -> None:
+    """Run the hosted OAuth web server and every configured referral watcher together."""
+    # Render exposes PORT to web services. Start the HTTP callback/health server
+    # in the same process so one Render Web Service can host the entire monitor.
+    if os.getenv("PORT"):
+        web_thread = threading.Thread(
+            target=threads_web_server,
+            name="referral-monitor-web",
+            daemon=True,
+        )
+        web_thread.start()
+        console.print("[green]Hosted OAuth/health web server starting.[/green]")
+
+    async def run() -> None:
+        pipeline_lock = asyncio.Lock()
+        tasks: list[asyncio.Task] = []
+
+        if X_BEARER_TOKEN and X_STREAM_RULES:
+            x_watcher = XFilteredStreamWatcher(
+                X_BEARER_TOKEN,
+                X_STREAM_RULES,
+                reconnect_seconds=X_STREAM_RECONNECT_SECONDS,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "X",
+                        x_watcher,
+                        pipeline_lock,
+                        before_stream=x_watcher.sync_rules,
+                    )
+                )
+            )
+        else:
+            console.print("[yellow]X skipped: not configured.[/yellow]")
+
+        if _youtube_configured():
+            youtube_watcher = YouTubeWatcher(
+                YOUTUBE_API_KEY,
+                YOUTUBE_QUERIES,
+                interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
+                max_results=YOUTUBE_SEARCH_LIMIT,
+                lookback_minutes=YOUTUBE_LOOKBACK_MINUTES,
+                status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "YouTube", youtube_watcher, pipeline_lock, retry_seconds=60
+                    )
+                )
+            )
+        else:
+            console.print("[yellow]YouTube skipped: not configured.[/yellow]")
+
+        if _web_configured():
+            web_watcher = ExaWebWatcher(
+                EXA_API_KEY,
+                EXA_QUERIES,
+                interval_seconds=EXA_WATCH_INTERVAL_SECONDS,
+                max_results=EXA_SEARCH_LIMIT,
+                lookback_minutes=EXA_LOOKBACK_MINUTES,
+                search_type=EXA_SEARCH_TYPE,
+                page_fetch_timeout_seconds=EXA_PAGE_FETCH_TIMEOUT_SECONDS,
+                status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Web / Exa", web_watcher, pipeline_lock, retry_seconds=60
+                    )
+                )
+            )
+        else:
+            console.print("[yellow]Web / Exa skipped: not configured.[/yellow]")
+
+        if _podcast_configured():
+            podcast_watcher = PodcastWatcher(
+                PODCAST_INDEX_API_KEY,
+                PODCAST_INDEX_API_SECRET,
+                PODCAST_INDEX_USER_AGENT,
+                interval_seconds=PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
+                recent_max=PODCAST_INDEX_RECENT_MAX,
+                lookback_minutes=PODCAST_LOOKBACK_MINUTES,
+                discovery_queries=PODCAST_DISCOVERY_QUERIES,
+                discovery_interval_seconds=PODCAST_DISCOVERY_INTERVAL_SECONDS,
+                rss_interval_seconds=PODCAST_RSS_INTERVAL_SECONDS,
+                rss_max_feeds=PODCAST_RSS_MAX_FEEDS,
+                source_registry_path=PODCAST_SOURCE_REGISTRY,
+                status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Podcast / RSS", podcast_watcher, pipeline_lock, retry_seconds=60
+                    )
+                )
+            )
+        else:
+            console.print("[yellow]Podcast / RSS skipped: not configured.[/yellow]")
+
+        if _reddit_configured():
+            reddit_watcher = RedditWatcher(
+                REDDIT_CLIENT_ID,
+                REDDIT_CLIENT_SECRET,
+                REDDIT_USER_AGENT,
+                REDDIT_QUERIES,
+                interval_seconds=REDDIT_WATCH_INTERVAL_SECONDS,
+                limit=REDDIT_SEARCH_LIMIT,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Reddit", reddit_watcher, pipeline_lock
+                    )
+                )
+            )
+        else:
+            console.print("[yellow]Reddit skipped: awaiting API access/configuration.[/yellow]")
+
+        # Threads is special: the same hosted process receives OAuth and saves the
+        # token. This task waits until that happens, then starts automatically.
+        if _threads_oauth_configured() or _threads_configured():
+            tasks.append(asyncio.create_task(_run_threads_hosted(pipeline_lock)))
+        else:
+            console.print("[yellow]Threads skipped: OAuth app is not configured.[/yellow]")
+
+        if not tasks:
+            console.print(
+                "[yellow]No monitor sources are configured. Keeping the web service alive.[/yellow]"
+            )
+            await asyncio.Event().wait()
+
+        console.print(
+            f"[green]Unified Referral Monitor started with {len(tasks)} source task(s).[/green]"
+        )
+        await asyncio.gather(*tasks)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Unified Referral Monitor stopped.[/yellow]")
 
 
 @cli.command("recent")
