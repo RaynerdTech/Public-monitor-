@@ -1,4 +1,5 @@
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +21,36 @@ class BrowserFetchResult:
 
 
 _BROWSER_LOCK = asyncio.Lock()
+
+
+def _is_hosted_runtime() -> bool:
+    """Return True for hosted Linux deployments such as Render.
+
+    Render exposes RENDER_EXTERNAL_URL / RENDER_EXTERNAL_HOSTNAME and PORT.  The
+    PORT fallback also keeps this useful on other container hosts without
+    changing local Windows behaviour.
+    """
+    return bool(
+        os.getenv("RENDER_EXTERNAL_URL")
+        or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        or (os.getenv("PORT") and os.name != "nt")
+    )
+
+
+def _browser_headless() -> bool:
+    # Hosted services do not have an interactive desktop/display.  Keep the
+    # existing local setting on developer machines so a user can manually clear
+    # a challenge when needed.
+    return True if _is_hosted_runtime() else VALIDATOR_BROWSER_HEADLESS
+
+
+def _profile_dir() -> Path:
+    configured = Path(VALIDATOR_BROWSER_PROFILE_DIR).expanduser()
+    if _is_hosted_runtime() and not configured.is_absolute():
+        # /tmp is writable in Render/Docker.  A paid persistent disk can still
+        # be used by setting VALIDATOR_BROWSER_PROFILE_DIR to an absolute path.
+        configured = Path("/tmp") / configured
+    return configured.resolve()
 
 
 async def _challenge_present(page) -> bool:
@@ -44,26 +75,44 @@ async def _challenge_present(page) -> bool:
 
 
 async def _launch_persistent_context(playwright):
-    profile_dir = Path(VALIDATOR_BROWSER_PROFILE_DIR).expanduser().resolve()
+    profile_dir = _profile_dir()
     profile_dir.mkdir(parents=True, exist_ok=True)
 
+    hosted = _is_hosted_runtime()
+    headless = _browser_headless()
+
+    # Render's Docker image installs Playwright's bundled Chromium, not branded
+    # Google Chrome/Edge.  Locally we keep the configured branded browser first
+    # because that preserves the existing Windows workflow, then fall back to
+    # Playwright Chromium if it is installed.
     channels: list[str | None] = []
-    if VALIDATOR_BROWSER_CHANNEL:
-        channels.append(VALIDATOR_BROWSER_CHANNEL)
-    for channel in ("chrome", "msedge"):
-        if channel not in channels:
-            channels.append(channel)
+    if hosted:
+        channels.append(None)
+    else:
+        configured = VALIDATOR_BROWSER_CHANNEL.strip() if VALIDATOR_BROWSER_CHANNEL else ""
+        if configured.lower() in {"chromium", "playwright", "bundled"}:
+            channels.append(None)
+        elif configured:
+            channels.append(configured)
+        for channel in ("chrome", "msedge", None):
+            if channel not in channels:
+                channels.append(channel)
 
     last_error: Exception | None = None
     for channel in channels:
         try:
-            return await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                channel=channel,
-                headless=VALIDATOR_BROWSER_HEADLESS,
-                viewport={"width": 1280, "height": 900},
-            )
-        except Exception as exc:  # pragma: no cover - depends on local browsers
+            kwargs = {
+                "user_data_dir": str(profile_dir),
+                "headless": headless,
+                "viewport": {"width": 1280, "height": 900},
+                # Render's containers have a small /dev/shm allocation.  This
+                # avoids Chromium crashes under the 512 MB free instance.
+                "args": ["--disable-dev-shm-usage"],
+            }
+            if channel is not None:
+                kwargs["channel"] = channel
+            return await playwright.chromium.launch_persistent_context(**kwargs)
+        except Exception as exc:  # pragma: no cover - runtime/browser specific
             last_error = exc
 
     if last_error:
@@ -74,10 +123,10 @@ async def _launch_persistent_context(playwright):
 async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
     """Fetch Claude's referral API from a real browser session.
 
-    This is only used after the normal HTTP validator is challenged by Cloudflare.
-    The profile is persistent so a normal Cloudflare clearance can be reused later.
+    This is only used after the normal HTTP validator is challenged by
+    Cloudflare.  The browser profile is reused while the process is alive, and
+    can be placed on persistent storage through VALIDATOR_BROWSER_PROFILE_DIR.
     """
-
     try:
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
@@ -102,7 +151,6 @@ async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
                     page.set_default_timeout(
                         int(VALIDATOR_BROWSER_NAVIGATION_TIMEOUT_SECONDS * 1000)
                     )
-
                     try:
                         await page.goto(
                             referral_url,
@@ -110,33 +158,32 @@ async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
                             timeout=int(VALIDATOR_BROWSER_NAVIGATION_TIMEOUT_SECONDS * 1000),
                         )
                     except PlaywrightTimeoutError:
-                        # A challenge page can keep loading while the user completes it.
+                        # Challenge pages can keep loading while their JS runs.
                         pass
 
+                    # Do not immediately fail in hosted/headless mode.  Some
+                    # Cloudflare managed challenges resolve automatically after
+                    # browser JavaScript/cookies complete.  We only classify it
+                    # blocked if the challenge remains after the configured wait.
                     if await _challenge_present(page):
-                        if VALIDATOR_BROWSER_HEADLESS:
-                            return BrowserFetchResult(
-                                status_code=403,
-                                message=(
-                                    "Cloudflare challenge is still present in headless mode. "
-                                    "Use headed browser fallback for initial clearance."
-                                ),
-                            )
-
-                        deadline = asyncio.get_running_loop().time() + max(
-                            5, VALIDATOR_BROWSER_CHALLENGE_WAIT_SECONDS
-                        )
+                        wait_seconds = max(5, VALIDATOR_BROWSER_CHALLENGE_WAIT_SECONDS)
+                        if _is_hosted_runtime():
+                            # Do not stall every source pipeline for two minutes
+                            # on a server-side challenge that needs human action.
+                            wait_seconds = min(wait_seconds, 30)
+                        deadline = asyncio.get_running_loop().time() + wait_seconds
                         while asyncio.get_running_loop().time() < deadline:
+                            await asyncio.sleep(1)
                             if not await _challenge_present(page):
                                 break
-                            await asyncio.sleep(1)
 
                         if await _challenge_present(page):
+                            mode = "hosted headless browser" if _browser_headless() else "browser"
                             return BrowserFetchResult(
                                 status_code=403,
                                 message=(
-                                    "Cloudflare challenge was not cleared before the browser "
-                                    "validation timeout."
+                                    f"Cloudflare challenge remained in the {mode} after "
+                                    f"{wait_seconds}s."
                                 ),
                             )
 
@@ -168,7 +215,6 @@ async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
                         """,
                         api_url,
                     )
-
                     return BrowserFetchResult(
                         status_code=int(result.get("status") or 0),
                         text=str(result.get("text") or ""),
@@ -177,8 +223,10 @@ async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
                     )
                 finally:
                     await context.close()
-        except Exception as exc:  # pragma: no cover - local browser/runtime specific
+        except Exception as exc:  # pragma: no cover - runtime/browser specific
+            # Keep the concrete launch/runtime error in Render logs through the
+            # ValidationResult message instead of returning an opaque "blocked".
             return BrowserFetchResult(
                 status_code=0,
-                message=f"Browser validation failed: {exc}",
+                message=f"Browser validation failed: {type(exc).__name__}: {exc}",
             )
