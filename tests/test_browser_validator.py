@@ -1,4 +1,4 @@
-import os
+from pathlib import Path
 
 from app.services import browser_validator
 
@@ -21,4 +21,5 @@ def test_local_runtime_keeps_configured_headless_setting(monkeypatch):
 def test_hosted_relative_profile_moves_to_tmp(monkeypatch):
     monkeypatch.setenv("RENDER_EXTERNAL_URL", "https://example.onrender.com")
     monkeypatch.setattr(browser_validator, "VALIDATOR_BROWSER_PROFILE_DIR", ".referral-browser-profile")
-    assert str(browser_validator._profile_dir()).startswith("/tmp/")
+    expected = (Path("/tmp") / ".referral-browser-profile").resolve()
+    assert browser_validator._profile_dir() == expected
