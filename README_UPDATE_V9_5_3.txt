@@ -1,16 +1,16 @@
-Referral Monitor v9.5.3 hotfix
+Referral Monitor v9.5.3
 
-Fixes the hosted Playwright browser path mismatch seen on Render.
+Fixes the Render/Docker Playwright browser path mismatch seen in hosted validator logs.
 
-Problem:
-- Playwright installed Chromium during the Docker build under the build user's home cache.
-- At runtime Render looked for Chromium under a different home/cache path.
-- Result: "Executable doesn't exist" and hosted browser validation stayed blocked.
+Why the previous build failed:
+- Chromium was installed during the Docker build under one HOME/cache path.
+- Render's runtime HOME caused Playwright to look under /opt/render/.cache/ms-playwright.
+- Result: browser fallback reported that the Chromium executable did not exist.
 
-Fix:
-- Sets PLAYWRIGHT_BROWSERS_PATH=/ms-playwright in the Docker image.
-- Installs Chromium into that shared fixed path.
-- Keeps the same path available at runtime.
-- Makes the browser directory readable/executable by the runtime user.
+What changed:
+- PLAYWRIGHT_BROWSERS_PATH is pinned to /ms-playwright for both build and runtime.
+- Chromium is installed into that shared path.
+- Browser garbage collection is disabled for the image so the installed binary is retained.
+- Build prints Playwright's installed-browser list for easier Render diagnostics.
 
-After applying, push to GitHub and redeploy the Render Docker service.
+No application logic or API settings were changed.
