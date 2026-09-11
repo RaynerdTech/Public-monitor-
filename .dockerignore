@@ -1,0 +1,12 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+.pytest_cache
+*.pyc
+.env
+.env.*
+referrals.db
+.referral-browser-profile
+podcast_sources.json

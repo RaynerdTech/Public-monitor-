@@ -1,23 +1,12 @@
 services:
   - type: web
     name: referral-monitor
-    runtime: python
-    plan: 0.5c-512mb
-    buildCommand: pip install -r requirements.txt
-    startCommand: python -m app.main watch-all
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.10
-      - key: THREADS_TOKEN_FILE
-        value: /var/data/.threads-token.json
-      - key: DATABASE_PATH
-        value: /var/data/referrals.db
-      - key: PODCAST_SOURCE_REGISTRY
-        value: /var/data/podcast_sources.json
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /ms-playwright
       - key: VALIDATOR_BROWSER_PROFILE_DIR
-        value: /var/data/browser-profile
-    disk:
-      name: referral-monitor-data
-      mountPath: /var/data
-      sizeGB: 1
+        value: /tmp/referral-browser-profile
