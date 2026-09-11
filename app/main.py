@@ -691,10 +691,9 @@ def threads_web_server() -> None:
         )
     if redirect_uri:
         console.print(f"Callback URL: [cyan]{redirect_uri}[/cyan]")
-        auth_path = "/threads/authorize"
-        if THREADS_OAUTH_START_KEY:
-            auth_path += f"?key={THREADS_OAUTH_START_KEY}"
-        console.print(f"Authorization path: [cyan]{auth_path}[/cyan]")
+        # Never print THREADS_OAUTH_START_KEY. Render logs are visible to anyone
+        # with service log access and should not contain authorization secrets.
+        console.print("Authorization endpoint: [cyan]/threads/authorize[/cyan]")
     else:
         console.print(
             "[yellow]No public callback URL yet. Generate the hosting domain, then set THREADS_REDIRECT_URI and redeploy.[/yellow]"
@@ -1684,6 +1683,29 @@ def watch_all() -> None:
     async def run() -> None:
         pipeline_lock = asyncio.Lock()
         tasks: list[asyncio.Task] = []
+
+        # Optional one-shot hosted validator diagnostic. This is intentionally
+        # driven by an environment variable so Render Free can test Chromium
+        # without Shell/one-off job access. Remove the variable after testing.
+        startup_test_code = os.getenv("VALIDATOR_STARTUP_TEST_CODE", "").strip()
+        if startup_test_code:
+            console.print(
+                f"[cyan]Hosted validator startup test: {startup_test_code}[/cyan]"
+            )
+            try:
+                test_result = await validate_referral(startup_test_code)
+                console.print(
+                    "[cyan]Hosted validator result:[/cyan] "
+                    f"status={test_result.status} "
+                    f"method={test_result.method} "
+                    f"campaign={test_result.campaign or '-'} "
+                    f"message={test_result.message or '-'}"
+                )
+            except Exception as exc:
+                console.print(
+                    "[red]Hosted validator startup test failed:[/red] "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
         if X_BEARER_TOKEN and X_STREAM_RULES:
             x_watcher = XFilteredStreamWatcher(
