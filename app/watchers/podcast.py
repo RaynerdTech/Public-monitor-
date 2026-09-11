@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 
+from app.core.activity_log import activity
 from app.core.extractor import extract_referral_links
 from app.watchers.base import BaseWatcher, SourcePost
 
@@ -471,8 +472,10 @@ class PodcastWatcher(BaseWatcher):
 
     async def fetch(self) -> list[SourcePost]:
         if not self.api_key or not self.api_secret:
+            activity("source_poll_skipped", source="Podcast / RSS", reason="not_configured")
             return []
 
+        activity("source_poll_started", source="Podcast / RSS")
         now = time.monotonic()
         posts: list[SourcePost] = []
         timeout = httpx.Timeout(30.0, connect=10.0)
@@ -499,6 +502,12 @@ class PodcastWatcher(BaseWatcher):
             key=lambda post: post.created_at
             or datetime.min.replace(tzinfo=timezone.utc)
         )
+        activity(
+            "source_poll_completed",
+            source="Podcast / RSS",
+            posts_found=len(unique),
+            rss_feeds=len(self._feeds),
+        )
         return unique
 
     async def stream(self):
@@ -520,10 +529,24 @@ class PodcastWatcher(BaseWatcher):
                 self._status(
                     f"Podcast Index HTTP {code}. Retrying automatically in {backoff}s."
                 )
+                activity(
+                    "source_poll_failed",
+                    source="Podcast / RSS",
+                    http_status=code,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 backoff = min(max(backoff * 2, 120), 900)
                 self._status(
                     f"Podcast network error. Retrying automatically in {backoff}s."
+                )
+                activity(
+                    "source_poll_failed",
+                    source="Podcast / RSS",
+                    error_type=type(exc).__name__,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
                 )
                 await asyncio.sleep(backoff)

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from app.core.activity_log import activity
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -168,8 +169,10 @@ class ExaWebWatcher(BaseWatcher):
 
     async def fetch(self) -> list[SourcePost]:
         if not self.api_key or not self.queries:
+            activity("source_poll_skipped", source="Web / Exa", reason="not_configured")
             return []
 
+        activity("source_poll_started", source="Web / Exa")
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(minutes=self.lookback_minutes)
         future_tolerance = now + timedelta(minutes=10)
@@ -232,6 +235,12 @@ class ExaWebWatcher(BaseWatcher):
                     posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or now)
+        activity(
+            "source_poll_completed",
+            source="Web / Exa",
+            candidates=len(candidates),
+            posts_found=len(posts),
+        )
         return posts
 
     async def stream(self):
@@ -251,8 +260,22 @@ class ExaWebWatcher(BaseWatcher):
                 else:
                     backoff = min(max(backoff, 120), 900)
                 self._status(f"Exa web search HTTP {code}. Retrying automatically in {backoff}s.")
+                activity(
+                    "source_poll_failed",
+                    source="Web / Exa",
+                    http_status=code,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 backoff = min(max(backoff * 2, 60), 900)
                 self._status(f"Exa web search network error. Retrying automatically in {backoff}s.")
+                activity(
+                    "source_poll_failed",
+                    source="Web / Exa",
+                    error_type=type(exc).__name__,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)

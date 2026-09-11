@@ -10,3 +10,9 @@ services:
         value: /ms-playwright
       - key: VALIDATOR_BROWSER_PROFILE_DIR
         value: /tmp/referral-browser-profile
+      - key: VALIDATOR_BROWSER_CHALLENGE_WAIT_SECONDS
+        value: 5
+      - key: VALIDATION_QUEUE_POLL_SECONDS
+        value: 2
+      - key: VALIDATION_QUEUE_WORKERS
+        value: 3

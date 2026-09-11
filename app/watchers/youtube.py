@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from app.core.activity_log import activity
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -176,8 +177,10 @@ class YouTubeWatcher(BaseWatcher):
 
     async def fetch(self) -> list[SourcePost]:
         if not self.api_key or not self.queries:
+            activity("source_poll_skipped", source="YouTube", reason="not_configured")
             return []
 
+        activity("source_poll_started", source="YouTube")
         now = datetime.now(timezone.utc)
         published_after = self._published_after(now)
         candidate_ids: list[str] = []
@@ -205,6 +208,12 @@ class YouTubeWatcher(BaseWatcher):
                 posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
+        activity(
+            "source_poll_completed",
+            source="YouTube",
+            candidates=len(candidate_ids),
+            posts_found=len(posts),
+        )
         return posts
 
     async def stream(self):
@@ -223,6 +232,13 @@ class YouTubeWatcher(BaseWatcher):
                         "YouTube daily search quota reached. Sleeping until after the next "
                         f"quota reset, then continuing automatically ({reset_at.isoformat(timespec='minutes')})."
                     )
+                    activity(
+                        "source_poll_failed",
+                        source="YouTube",
+                        http_status=exc.response.status_code,
+                        retry_in_seconds=sleep_seconds,
+                        level="ERROR",
+                    )
                     await asyncio.sleep(sleep_seconds)
                     backoff = self.interval_seconds
                     continue
@@ -238,8 +254,22 @@ class YouTubeWatcher(BaseWatcher):
                 self._status(
                     f"YouTube HTTP {exc.response.status_code}. Retrying automatically in {backoff}s."
                 )
+                activity(
+                    "source_poll_failed",
+                    source="YouTube",
+                    http_status=exc.response.status_code,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 backoff = min(max(backoff * 2, 300), 1800)
                 self._status(f"YouTube network error. Retrying automatically in {backoff}s.")
+                activity(
+                    "source_poll_failed",
+                    source="YouTube",
+                    error_type=type(exc).__name__,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)

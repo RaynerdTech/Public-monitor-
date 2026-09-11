@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app.core.activity_log import activity
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -269,7 +270,13 @@ class XFilteredStreamWatcher:
                 response = await client.post(X_STREAM_RULES_URL, json=payload)
                 response.raise_for_status()
 
-            return await self.list_rules(client)
+            synced = await self.list_rules(client)
+            activity(
+                "x_stream_rules_synced",
+                configured_rules=len(self.rules),
+                active_rules=len(synced),
+            )
+            return synced
 
     async def stream(self):
         params = {
@@ -282,6 +289,7 @@ class XFilteredStreamWatcher:
 
         while True:
             try:
+                activity("x_stream_connecting")
                 async with httpx.AsyncClient(
                     timeout=timeout,
                     headers=self.headers,
@@ -290,6 +298,7 @@ class XFilteredStreamWatcher:
                     async with client.stream("GET", X_STREAM_URL, params=params) as response:
                         response.raise_for_status()
                         backoff = self.reconnect_seconds
+                        activity("x_stream_connected")
 
                         async for line in response.aiter_lines():
                             if not line.strip():
@@ -314,12 +323,30 @@ class XFilteredStreamWatcher:
             except httpx.HTTPStatusError as exc:
                 # Auth/payment failures require user action instead of an endless loop.
                 if exc.response.status_code in {401, 402, 403}:
+                    activity(
+                        "x_stream_failed",
+                        http_status=exc.response.status_code,
+                        retryable=False,
+                        level="ERROR",
+                    )
                     raise
                 if exc.response.status_code == 429:
                     backoff = min(max(backoff * 2, 60), 900)
                 else:
                     backoff = min(max(backoff * 2, 5), 300)
+                activity(
+                    "x_stream_reconnecting",
+                    http_status=exc.response.status_code,
+                    retry_in_seconds=backoff,
+                    level="WARNING",
+                )
                 await asyncio.sleep(backoff)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 backoff = min(max(backoff * 2, 5), 300)
+                activity(
+                    "x_stream_reconnecting",
+                    error_type=type(exc).__name__,
+                    retry_in_seconds=backoff,
+                    level="WARNING",
+                )
                 await asyncio.sleep(backoff)

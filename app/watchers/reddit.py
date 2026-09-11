@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app.core.activity_log import activity
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -126,6 +127,7 @@ class RedditWatcher(BaseWatcher):
         return payload if isinstance(payload, dict) else {}
 
     async def fetch(self) -> list[SourcePost]:
+        activity("source_poll_started", source="Reddit")
         posts: list[SourcePost] = []
 
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
@@ -167,6 +169,7 @@ class RedditWatcher(BaseWatcher):
         posts.sort(
             key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc)
         )
+        activity("source_poll_completed", source="Reddit", posts_found=len(posts))
         return posts
 
     async def stream(self):
@@ -185,7 +188,21 @@ class RedditWatcher(BaseWatcher):
                     raise
                 else:
                     backoff = min(max(backoff, 30), 300)
+                activity(
+                    "source_poll_failed",
+                    source="Reddit",
+                    http_status=exc.response.status_code,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)
-            except httpx.HTTPError:
+            except httpx.HTTPError as exc:
                 backoff = min(max(backoff * 2, 30), 300)
+                activity(
+                    "source_poll_failed",
+                    source="Reddit",
+                    error_type=type(exc).__name__,
+                    retry_in_seconds=backoff,
+                    level="ERROR",
+                )
                 await asyncio.sleep(backoff)

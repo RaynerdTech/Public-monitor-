@@ -67,8 +67,10 @@ from app.config import (
     X_WATCH_INTERVAL_SECONDS,
 )
 from app.core.database import get_recent_referrals, get_referral_by_code, init_db, update_validation
+from app.core.activity_log import activity
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.services.pipeline import process_post
+from app.services.retry_queue import run_retry_queues
 from app.services.threads_oauth import (
     build_threads_authorization_url,
     create_token_record,
@@ -102,6 +104,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
+APP_VERSION = "9.7"
 
 
 def _print_results(results) -> None:
@@ -133,11 +136,17 @@ def _threads_current_token(*, refresh_if_needed: bool = False) -> str:
 
     if refresh_if_needed and record.needs_refresh() and THREADS_APP_SECRET:
         try:
+            activity("threads_token_refresh_started")
             record = refresh_token_record(record=record)
             save_threads_token(THREADS_TOKEN_FILE, record)
-        except Exception:
+            activity("threads_token_refresh_completed")
+        except Exception as exc:
             # Keep using the still-valid token if a refresh attempt fails.
-            pass
+            activity(
+                "threads_token_refresh_failed",
+                error_type=type(exc).__name__,
+                level="ERROR",
+            )
 
     return record.access_token
 
@@ -564,12 +573,18 @@ def threads_web_server() -> None:
         def do_GET(self) -> None:  # noqa: N802
             request_url = urlparse(self.path)
 
-            if request_url.path in {"/", "/health"}:
-                self._send_html(200, "Referral Monitor", "Threads OAuth service is running.")
+            if request_url.path in {"/", "/health", "/version"}:
+                self._send_html(
+                    200,
+                    f"Referral Monitor v{APP_VERSION}",
+                    "Threads OAuth service and production queues are running.",
+                )
                 return
 
             if request_url.path == "/threads/authorize":
+                activity("threads_oauth_authorize_requested")
                 if not oauth_configured:
+                    activity("threads_oauth_authorize_unavailable", reason="app_not_configured", level="ERROR")
                     self._send_html(
                         503,
                         "Threads OAuth not ready",
@@ -577,6 +592,7 @@ def threads_web_server() -> None:
                     )
                     return
                 if not redirect_uri:
+                    activity("threads_oauth_authorize_unavailable", reason="redirect_not_configured", level="ERROR")
                     self._send_html(
                         503,
                         "Threads OAuth not ready",
@@ -587,6 +603,7 @@ def threads_web_server() -> None:
                 params = parse_qs(request_url.query)
                 supplied_key = (params.get("key") or [""])[0]
                 if THREADS_OAUTH_START_KEY and supplied_key != THREADS_OAUTH_START_KEY:
+                    activity("threads_oauth_authorize_denied", reason="invalid_start_key", level="WARNING")
                     self._send_html(403, "Forbidden", "Invalid authorization start key.")
                     return
 
@@ -599,12 +616,16 @@ def threads_web_server() -> None:
                     THREADS_OAUTH_SCOPES,
                     state,
                 )
+                activity("threads_oauth_redirected_to_meta")
                 self._redirect(auth_url)
                 return
 
             if request_url.path != "/threads/callback":
+                activity("http_not_found", path=request_url.path, level="WARNING")
                 self._send_html(404, "Not found", "Unknown endpoint.")
                 return
+
+            activity("threads_oauth_callback_received")
 
             if not oauth_configured:
                 self._send_html(
@@ -627,11 +648,13 @@ def threads_web_server() -> None:
             code = (params.get("code") or [""])[0]
 
             if error:
+                activity("threads_oauth_callback_rejected", reason="provider_error", level="ERROR")
                 self._send_html(400, "Threads authorization failed", str(error))
                 return
 
             _prune_states()
             if not returned_state or returned_state not in pending_states:
+                activity("threads_oauth_callback_rejected", reason="invalid_state", level="ERROR")
                 self._send_html(
                     400,
                     "Invalid OAuth state",
@@ -641,6 +664,7 @@ def threads_web_server() -> None:
             pending_states.pop(returned_state, None)
 
             if not code:
+                activity("threads_oauth_callback_rejected", reason="missing_code", level="ERROR")
                 self._send_html(
                     400,
                     "Missing authorization code",
@@ -675,7 +699,13 @@ def threads_web_server() -> None:
                     f"{display_user} was authorized successfully. You can close this page.",
                 )
                 console.print(f"[green]Threads OAuth completed for {display_user}.[/green]")
+                activity("threads_oauth_completed", username=username)
             except Exception as exc:
+                activity(
+                    "threads_oauth_token_exchange_failed",
+                    error_type=type(exc).__name__,
+                    level="ERROR",
+                )
                 console.print(f"[red]Threads token exchange failed: {type(exc).__name__}: {exc}[/red]")
                 self._send_html(
                     500,
@@ -684,6 +714,12 @@ def threads_web_server() -> None:
                 )
 
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    activity(
+        "oauth_web_server_started",
+        port=port,
+        oauth_configured=oauth_configured,
+        redirect_configured=bool(redirect_uri),
+    )
     console.print(f"[green]Threads web service listening on 0.0.0.0:{port}[/green]")
     if not oauth_configured:
         console.print(
@@ -1574,7 +1610,6 @@ def watch_x() -> None:
 async def _run_configured_monitor_stream(
     name: str,
     watcher,
-    pipeline_lock: asyncio.Lock,
     *,
     retry_seconds: int = 30,
     before_stream=None,
@@ -1584,16 +1619,24 @@ async def _run_configured_monitor_stream(
 
     while True:
         try:
+            activity("watcher_started", source=name)
             if before_stream is not None:
                 await before_stream()
+                activity("watcher_preflight_completed", source=name)
 
             async for post in watcher.stream():
+                activity(
+                    "source_post_received",
+                    source=name,
+                    post_source=post.source,
+                    source_url=post.url,
+                    post_created_at=post.created_at,
+                )
                 console.print(
                     f"[cyan]{name} match:[/cyan] {post.source} "
                     f"{post.created_at.isoformat() if post.created_at else ''}"
                 )
-                async with pipeline_lock:
-                    results = await process_post(post)
+                results = await process_post(post, defer_validation=True)
                 _print_results(results)
 
             # stream() implementations are intended to be infinite. If one ever
@@ -1602,6 +1645,13 @@ async def _run_configured_monitor_stream(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            activity(
+                "watcher_error",
+                source=name,
+                error_type=type(exc).__name__,
+                retry_in_seconds=backoff,
+                level="ERROR",
+            )
             console.print(
                 f"[yellow]{name} watcher error: {type(exc).__name__}: {exc}. "
                 f"Retrying in {backoff}s.[/yellow]"
@@ -1610,7 +1660,7 @@ async def _run_configured_monitor_stream(
             backoff = min(backoff * 2, 300)
 
 
-async def _run_threads_hosted(pipeline_lock: asyncio.Lock) -> None:
+async def _run_threads_hosted() -> None:
     """Wait for OAuth, then monitor Threads and transparently pick up refreshed tokens."""
     last_wait_message = False
 
@@ -1618,6 +1668,7 @@ async def _run_threads_hosted(pipeline_lock: asyncio.Lock) -> None:
         token = _threads_current_token(refresh_if_needed=True)
         if not token:
             if not last_wait_message:
+                activity("threads_waiting_for_oauth", level="WARNING")
                 console.print(
                     "[yellow]Threads watcher waiting for OAuth authorization/token.[/yellow]"
                 )
@@ -1636,6 +1687,12 @@ async def _run_threads_hosted(pipeline_lock: asyncio.Lock) -> None:
             "[green]Threads watcher active.[/green] "
             f"Queries: {', '.join(THREADS_QUERIES)} | interval: {THREADS_WATCH_INTERVAL_SECONDS}s"
         )
+        activity(
+            "watcher_started",
+            source="Threads",
+            interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
+            query_count=len(THREADS_QUERIES),
+        )
 
         try:
             while True:
@@ -1646,19 +1703,38 @@ async def _run_threads_hosted(pipeline_lock: asyncio.Lock) -> None:
                     # Token was refreshed/replaced; rebuild the watcher with it.
                     break
 
+                activity("source_poll_started", source="Threads")
                 posts = await watcher.fetch()
+                activity(
+                    "source_poll_completed",
+                    source="Threads",
+                    posts_found=len(posts),
+                )
                 for post in posts:
+                    activity(
+                        "source_post_received",
+                        source="Threads",
+                        post_source=post.source,
+                        source_url=post.url,
+                        post_created_at=post.created_at,
+                    )
                     console.print(
                         f"[cyan]Threads match:[/cyan] {post.source} "
                         f"{post.created_at.isoformat() if post.created_at else ''}"
                     )
-                    async with pipeline_lock:
-                        results = await process_post(post)
+                    results = await process_post(post, defer_validation=True)
                     _print_results(results)
                 await asyncio.sleep(THREADS_WATCH_INTERVAL_SECONDS)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            activity(
+                "watcher_error",
+                source="Threads",
+                error_type=type(exc).__name__,
+                retry_in_seconds=30,
+                level="ERROR",
+            )
             console.print(
                 f"[yellow]Threads watcher error: {type(exc).__name__}: {exc}. "
                 "Retrying automatically.[/yellow]"
@@ -1681,8 +1757,13 @@ def watch_all() -> None:
         console.print("[green]Hosted OAuth/health web server starting.[/green]")
 
     async def run() -> None:
-        pipeline_lock = asyncio.Lock()
-        tasks: list[asyncio.Task] = []
+        tasks: list[asyncio.Task] = [asyncio.create_task(run_retry_queues())]
+        source_task_count = 0
+        activity(
+            "monitor_starting",
+            version=APP_VERSION,
+            runtime="hosted" if os.getenv("PORT") else "local",
+        )
 
         # Optional one-shot hosted validator diagnostic. This is intentionally
         # driven by an environment variable so Render Free can test Chromium
@@ -1718,12 +1799,13 @@ def watch_all() -> None:
                     _run_configured_monitor_stream(
                         "X",
                         x_watcher,
-                        pipeline_lock,
                         before_stream=x_watcher.sync_rules,
                     )
                 )
             )
+            source_task_count += 1
         else:
+            activity("watcher_skipped", source="X", reason="not_configured", level="WARNING")
             console.print("[yellow]X skipped: not configured.[/yellow]")
 
         if _youtube_configured():
@@ -1738,11 +1820,13 @@ def watch_all() -> None:
             tasks.append(
                 asyncio.create_task(
                     _run_configured_monitor_stream(
-                        "YouTube", youtube_watcher, pipeline_lock, retry_seconds=60
+                        "YouTube", youtube_watcher, retry_seconds=60
                     )
                 )
             )
+            source_task_count += 1
         else:
+            activity("watcher_skipped", source="YouTube", reason="not_configured", level="WARNING")
             console.print("[yellow]YouTube skipped: not configured.[/yellow]")
 
         if _web_configured():
@@ -1759,11 +1843,13 @@ def watch_all() -> None:
             tasks.append(
                 asyncio.create_task(
                     _run_configured_monitor_stream(
-                        "Web / Exa", web_watcher, pipeline_lock, retry_seconds=60
+                        "Web / Exa", web_watcher, retry_seconds=60
                     )
                 )
             )
+            source_task_count += 1
         else:
+            activity("watcher_skipped", source="Web / Exa", reason="not_configured", level="WARNING")
             console.print("[yellow]Web / Exa skipped: not configured.[/yellow]")
 
         if _podcast_configured():
@@ -1784,11 +1870,13 @@ def watch_all() -> None:
             tasks.append(
                 asyncio.create_task(
                     _run_configured_monitor_stream(
-                        "Podcast / RSS", podcast_watcher, pipeline_lock, retry_seconds=60
+                        "Podcast / RSS", podcast_watcher, retry_seconds=60
                     )
                 )
             )
+            source_task_count += 1
         else:
+            activity("watcher_skipped", source="Podcast / RSS", reason="not_configured", level="WARNING")
             console.print("[yellow]Podcast / RSS skipped: not configured.[/yellow]")
 
         if _reddit_configured():
@@ -1803,28 +1891,37 @@ def watch_all() -> None:
             tasks.append(
                 asyncio.create_task(
                     _run_configured_monitor_stream(
-                        "Reddit", reddit_watcher, pipeline_lock
+                        "Reddit", reddit_watcher
                     )
                 )
             )
+            source_task_count += 1
         else:
+            activity("watcher_skipped", source="Reddit", reason="not_configured", level="WARNING")
             console.print("[yellow]Reddit skipped: awaiting API access/configuration.[/yellow]")
 
         # Threads is special: the same hosted process receives OAuth and saves the
         # token. This task waits until that happens, then starts automatically.
         if _threads_oauth_configured() or _threads_configured():
-            tasks.append(asyncio.create_task(_run_threads_hosted(pipeline_lock)))
+            tasks.append(asyncio.create_task(_run_threads_hosted()))
+            source_task_count += 1
         else:
+            activity("watcher_skipped", source="Threads", reason="oauth_not_configured", level="WARNING")
             console.print("[yellow]Threads skipped: OAuth app is not configured.[/yellow]")
 
-        if not tasks:
+        if source_task_count == 0:
             console.print(
                 "[yellow]No monitor sources are configured. Keeping the web service alive.[/yellow]"
             )
             await asyncio.Event().wait()
 
         console.print(
-            f"[green]Unified Referral Monitor started with {len(tasks)} source task(s).[/green]"
+            f"[green]Unified Referral Monitor started with {source_task_count} source task(s).[/green]"
+        )
+        activity(
+            "monitor_started",
+            version=APP_VERSION,
+            source_tasks=source_task_count,
         )
         await asyncio.gather(*tasks)
 
