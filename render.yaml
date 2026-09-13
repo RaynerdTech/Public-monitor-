@@ -12,7 +12,11 @@ services:
         value: /tmp/referral-browser-profile
       - key: VALIDATOR_BROWSER_CHALLENGE_WAIT_SECONDS
         value: 5
+      - key: VALIDATOR_BROWSER_FALLBACK_ENABLED
+        value: false
       - key: VALIDATION_QUEUE_POLL_SECONDS
         value: 2
       - key: VALIDATION_QUEUE_WORKERS
         value: 3
+      - key: VALIDATION_MAX_ATTEMPTS
+        value: 1

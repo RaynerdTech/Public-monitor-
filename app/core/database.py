@@ -33,7 +33,10 @@ async def init_db() -> None:
                 validation_message TEXT,
                 validation_attempts INTEGER NOT NULL DEFAULT 0,
                 next_validation_at TEXT,
-                last_validated_at TEXT
+                last_validated_at TEXT,
+                feedback_status TEXT,
+                feedback_at TEXT,
+                feedback_by TEXT
             )
             """
         )
@@ -52,6 +55,12 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE referrals ADD COLUMN next_validation_at TEXT")
         if "last_validated_at" not in columns:
             await db.execute("ALTER TABLE referrals ADD COLUMN last_validated_at TEXT")
+        if "feedback_status" not in columns:
+            await db.execute("ALTER TABLE referrals ADD COLUMN feedback_status TEXT")
+        if "feedback_at" not in columns:
+            await db.execute("ALTER TABLE referrals ADD COLUMN feedback_at TEXT")
+        if "feedback_by" not in columns:
+            await db.execute("ALTER TABLE referrals ADD COLUMN feedback_by TEXT")
 
         await db.execute(
             """
@@ -248,8 +257,14 @@ async def get_due_validation_referrals(limit: int = 20) -> list[dict]:
                    validation_message, validation_attempts, next_validation_at,
                    last_validated_at
             FROM referrals
-            WHERE status IN ('pending', 'blocked', 'error', 'unknown')
-              AND (next_validation_at IS NULL OR next_validation_at <= ?)
+            WHERE (
+                (status = 'pending' AND validation_attempts = 0)
+                OR (
+                    status IN ('pending', 'blocked', 'error', 'unknown')
+                    AND next_validation_at IS NOT NULL
+                    AND next_validation_at <= ?
+                )
+            )
             ORDER BY
               CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
               CASE WHEN status = 'pending' THEN detected_at END DESC,
@@ -290,11 +305,11 @@ async def get_due_telegram_deliveries(limit: int = 50) -> list[dict]:
             SELECT d.id AS delivery_id, d.referral_code, d.chat_id,
                    d.status AS delivery_status, d.attempts,
                    r.referral_url, r.source, r.source_url,
-                   r.post_created_at, r.detected_at, r.campaign
+                   r.post_created_at, r.detected_at, r.campaign,
+                   r.status AS validation_status
             FROM telegram_deliveries AS d
             JOIN referrals AS r ON r.referral_code = d.referral_code
-            WHERE r.status = 'valid'
-              AND d.status IN ('pending', 'failed')
+            WHERE d.status IN ('pending', 'failed')
               AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
             ORDER BY d.next_attempt_at ASC, d.id ASC
             LIMIT ?
@@ -350,7 +365,8 @@ async def get_referral_by_code(referral_code: str) -> dict | None:
             """
             SELECT id, referral_url, referral_code, source, source_url,
                    post_created_at, detected_at, status, campaign, validation_message,
-                   validation_attempts, next_validation_at, last_validated_at
+                   validation_attempts, next_validation_at, last_validated_at,
+                   feedback_status, feedback_at, feedback_by
             FROM referrals
             WHERE referral_code = ?
             LIMIT 1
@@ -368,7 +384,8 @@ async def get_recent_referrals(limit: int = 20) -> list[dict]:
             """
             SELECT id, referral_url, referral_code, source, source_url,
                    post_created_at, detected_at, status, campaign, validation_message,
-                   validation_attempts, next_validation_at, last_validated_at
+                   validation_attempts, next_validation_at, last_validated_at,
+                   feedback_status, feedback_at, feedback_by
             FROM referrals
             ORDER BY id DESC
             LIMIT ?
@@ -377,3 +394,23 @@ async def get_recent_referrals(limit: int = 20) -> list[dict]:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+
+async def record_referral_feedback(
+    referral_code: str,
+    feedback_status: str,
+    feedback_by: str | None = None,
+) -> bool:
+    """Store the claim result reported by an authorized Telegram destination."""
+    now = datetime.now(timezone.utc).isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE referrals
+            SET feedback_status = ?, feedback_at = ?, feedback_by = ?
+            WHERE referral_code = ?
+            """,
+            (feedback_status, now, feedback_by, referral_code),
+        )
+        await db.commit()
+        return cursor.rowcount > 0

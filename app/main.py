@@ -70,7 +70,7 @@ from app.core.database import get_recent_referrals, get_referral_by_code, init_d
 from app.core.activity_log import activity
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.services.pipeline import process_post
-from app.services.retry_queue import run_retry_queues
+from app.services.retry_queue import run_retry_queues, run_telegram_feedback_loop
 from app.services.threads_oauth import (
     build_threads_authorization_url,
     create_token_record,
@@ -104,7 +104,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "9.7"
+APP_VERSION = "9.8"
 
 
 def _print_results(results) -> None:
@@ -1758,6 +1758,8 @@ def watch_all() -> None:
 
     async def run() -> None:
         tasks: list[asyncio.Task] = [asyncio.create_task(run_retry_queues())]
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+            tasks.append(asyncio.create_task(run_telegram_feedback_loop()))
         source_task_count = 0
         activity(
             "monitor_starting",

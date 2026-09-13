@@ -2,10 +2,19 @@ from collections.abc import Awaitable, Callable
 
 from app.config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_IDS
 from app.core.activity_log import activity
-from app.core.database import init_db, record_validation_attempt, save_referral
+from app.core.database import (
+    ensure_telegram_deliveries,
+    init_db,
+    record_validation_attempt,
+    save_referral,
+)
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.core.models import ReferralCandidate
-from app.services.telegram import format_referral_alert, send_telegram_message_all
+from app.services.telegram import (
+    format_referral_alert,
+    format_referral_keyboard,
+    send_telegram_message_all,
+)
 from app.services.validator import ValidationResult, validate_referral
 from app.watchers.base import SourcePost
 
@@ -56,9 +65,23 @@ async def process_post(
         )
 
         if defer_validation:
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+                await ensure_telegram_deliveries(code, TELEGRAM_CHAT_IDS)
+                activity(
+                    "telegram_delivery_queued",
+                    referral_code=code,
+                    destinations=len(TELEGRAM_CHAT_IDS),
+                    reason="immediate_discovery_alert",
+                )
+            else:
+                activity(
+                    "telegram_not_configured",
+                    referral_code=code,
+                    level="ERROR",
+                )
             queued = ValidationResult(
                 status="pending",
-                message="Queued for background validation",
+                message="Alert queued immediately; background check is informational",
                 method="queue",
             )
             activity(
@@ -102,6 +125,7 @@ async def process_post(
                     TELEGRAM_BOT_TOKEN,
                     TELEGRAM_CHAT_IDS,
                     alert,
+                    reply_markup=format_referral_keyboard(candidate),
                 )
                 activity(
                     "telegram_delivery_completed",
