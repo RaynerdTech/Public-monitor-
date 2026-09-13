@@ -43,6 +43,31 @@ def test_expanded_x_url_is_added_to_source_text():
     ]
 
 
+def test_x_reply_with_referral_is_labelled_as_reply():
+    row = {
+        "id": "reply123",
+        "text": "Try this https://t.co/referral",
+        "author_id": "42",
+        "referenced_tweets": [{"type": "replied_to", "id": "parent123"}],
+        "entities": {
+            "urls": [
+                {
+                    "url": "https://t.co/referral",
+                    "expanded_url": "https://claude.ai/referral/reply-code",
+                }
+            ]
+        },
+    }
+
+    post = x_row_to_source_post(row, {"42": "exampleuser"})
+
+    assert post is not None
+    assert post.source == "x-reply:@exampleuser"
+    assert extract_referral_links(post.text) == [
+        "https://claude.ai/referral/reply-code"
+    ]
+
+
 @pytest.mark.anyio
 async def test_x_watcher_fetch(monkeypatch):
     payload = {

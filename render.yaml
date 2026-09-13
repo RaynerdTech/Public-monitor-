@@ -20,3 +20,5 @@ services:
         value: 3
       - key: VALIDATION_MAX_ATTEMPTS
         value: 1
+      - key: YOUTUBE_LOOKBACK_MINUTES
+        value: 360

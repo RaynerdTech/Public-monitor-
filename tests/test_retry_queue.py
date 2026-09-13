@@ -199,7 +199,7 @@ async def test_authorized_telegram_feedback_is_saved_and_message_is_updated(
             "from": {"username": "operator"},
             "message": {
                 "message_id": 10,
-                "text": "NEW CLAUDE REFERRAL - OPEN NOW",
+                "text": "🚨 NEW CLAUDE REFERRAL FOUND",
                 "chat": {"id": "chat-1"},
             },
         }
@@ -210,4 +210,4 @@ async def test_authorized_telegram_feedback_is_saved_and_message_is_updated(
     assert stored["feedback_status"] == "worked"
     assert stored["feedback_by"] == "operator"
     assert answers == ["Worked"]
-    assert edits and "Claim result: WORKED" in edits[0]
+    assert edits and "User result: ✅ Worked" in edits[0]

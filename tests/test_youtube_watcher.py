@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import httpx
 import pytest
 
@@ -118,3 +120,56 @@ def test_detects_google_daily_quota_error():
     )
     exc = httpx.HTTPStatusError("quota", request=request, response=response)
     assert is_daily_quota_error(exc) is True
+
+
+def test_youtube_uses_full_rolling_lookback_after_every_poll():
+    watcher = YouTubeWatcher(
+        "api-key",
+        ["claude referral"],
+        lookback_minutes=360,
+        overlap_seconds=90,
+    )
+    now = datetime(2026, 9, 13, 20, 0, tzinfo=timezone.utc)
+
+    first_cutoff = watcher._published_after(now)
+    later_cutoff = watcher._published_after(now + timedelta(minutes=20))
+
+    assert first_cutoff == now - timedelta(hours=6)
+    assert later_cutoff == now - timedelta(hours=5, minutes=40)
+    assert later_cutoff != now - timedelta(seconds=90)
+
+
+@pytest.mark.anyio
+async def test_youtube_rechecks_video_if_referral_is_added_later(monkeypatch):
+    description = "No link yet"
+    search_payload = {"items": [{"id": {"videoId": "edited-video"}}]}
+
+    async def fake_get(self, url, params=None, **kwargs):
+        request = httpx.Request("GET", url)
+        if url.endswith("/search"):
+            return httpx.Response(200, request=request, json=search_payload)
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "items": [
+                    {
+                        "id": "edited-video",
+                        "snippet": {
+                            "title": "Claude referral",
+                            "description": description,
+                        },
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    watcher = YouTubeWatcher("api-key", ["claude referral"], lookback_minutes=360)
+
+    assert await watcher.fetch() == []
+    description = "https://claude.ai/referral/added-later"
+    posts = await watcher.fetch()
+
+    assert len(posts) == 1
+    assert "added-later" in posts[0].text

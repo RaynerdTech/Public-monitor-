@@ -117,14 +117,14 @@ async def edit_telegram_message(
 def format_referral_keyboard(candidate: ReferralCandidate) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": "Open referral now", "url": candidate.referral_url}],
+            [{"text": "🚀 Open referral now", "url": candidate.referral_url}],
             [
                 {
-                    "text": "Worked",
+                    "text": "✅ It worked",
                     "callback_data": f"referral_feedback:worked:{candidate.referral_code}",
                 },
                 {
-                    "text": "Already used / invalid",
+                    "text": "❌ Already used / invalid",
                     "callback_data": f"referral_feedback:unusable:{candidate.referral_code}",
                 },
             ],
@@ -145,10 +145,40 @@ def parse_referral_feedback(data: object) -> tuple[str, str] | None:
 
 
 def format_feedback_result(text: str, status: str) -> str:
-    lines = [line for line in text.splitlines() if not line.startswith("Claim result:")]
-    label = "WORKED" if status == "worked" else "ALREADY USED / INVALID"
-    lines.append(f"Claim result: {label} (reported in Telegram)")
+    lines = [line for line in text.splitlines() if not line.startswith("User result:")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    label = "✅ Worked" if status == "worked" else "❌ Already used or invalid"
+    lines.extend(["", f"User result: {label}"])
     return "\n".join(lines)
+
+
+def _friendly_source(source: str) -> str:
+    prefixes = {
+        "x-reply:": "X reply by ",
+        "x-quote:": "X quote by ",
+        "x-repost:": "X repost by ",
+        "x:": "X post by ",
+        "threads:": "Threads post by ",
+        "youtube:": "YouTube video from ",
+        "podcast-rss:": "Podcast episode from ",
+        "podcast:": "Podcast episode from ",
+        "web:": "Website: ",
+    }
+    for prefix, label in prefixes.items():
+        if source.startswith(prefix):
+            return f"{label}{source.removeprefix(prefix)}"
+    return source.replace("_", " ").strip().title() or "Unknown source"
+
+
+def _elapsed_label(seconds: int) -> str:
+    if seconds < 60:
+        return "under 1 minute" if seconds > 10 else "a few seconds"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    hours = minutes // 60
+    return f"{hours} hour{'s' if hours != 1 else ''}"
 
 
 def format_referral_alert(
@@ -165,42 +195,37 @@ def format_referral_alert(
             posted = posted.replace(tzinfo=timezone.utc)
         delay = max(0, int((candidate.detected_at - posted).total_seconds()))
 
-    lines = []
+    lines: list[str] = []
     if simulated:
-        lines.append("TEST ALERT - simulated validation")
-    elif result.status == "valid":
-        lines.append("NEW CLAUDE REFERRAL - API CHECK SAYS VALID")
+        lines.append("🧪 TEST REFERRAL ALERT")
     else:
-        lines.append("NEW CLAUDE REFERRAL - OPEN NOW")
+        lines.append("🚨 NEW CLAUDE REFERRAL FOUND")
 
     status_labels = {
-        "valid": "Valid",
-        "inactive": "Inactive",
-        "not_found": "Not found",
-        "contest": "Contest link",
-        "blocked": "Could not verify automatically - open manually",
-        "error": "Could not verify automatically - open manually",
-        "unknown": "Could not verify automatically - open manually",
-        "pending": "Not checked yet - open manually",
+        "valid": "✅ Looks active",
+        "inactive": "❌ Inactive",
+        "not_found": "❌ No longer available",
+        "contest": "ℹ️ Contest link, not a referral",
+        "blocked": "⚠️ Could not confirm automatically. Open it and try.",
+        "error": "⚠️ Could not confirm automatically. Open it and try.",
+        "unknown": "⚠️ Could not confirm automatically. Open it and try.",
+        "pending": "⏳ Still checking. Do not wait—open it now.",
     }
 
     lines.extend(
         [
-            f"Referral: {candidate.referral_url}",
-            f"Source: {candidate.source}",
-            f"Source URL: {candidate.source_url or '-'}",
-            f"Automatic check: {status_labels.get(result.status, result.status)}",
-            f"Campaign: {result.campaign or '-'}",
+            "Open it quickly because referral links can stop working at any time.",
+            "",
+            f"🔗 Link: {candidate.referral_url}",
+            f"📍 Found on: {_friendly_source(candidate.source)}",
+            f"🔎 Link check: {status_labels.get(result.status, '⚠️ Status unknown. Open it and try.')}",
         ]
     )
 
-    if candidate.post_created_at:
-        lines.append(f"Posted: {candidate.post_created_at.isoformat()}")
-    lines.append(f"Detected: {candidate.detected_at.isoformat()}")
     if delay is not None:
-        lines.append(f"Detection delay: {delay}s")
-    lines.append(f"Alert generated: {now.isoformat()}")
-    if result.status != "valid":
-        lines.append("The automatic check does not delay or decide delivery.")
+        lines.append(f"⚡ Found after: {_elapsed_label(delay)}")
+    lines.append(f"🕒 Alert time: {now.strftime('%Y-%m-%d %H:%M UTC')}")
+    if candidate.source_url:
+        lines.extend(["", f"Original post: {candidate.source_url}"])
 
     return "\n".join(lines)

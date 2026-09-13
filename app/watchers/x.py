@@ -94,8 +94,22 @@ def x_row_to_source_post(row: dict, usernames: dict[str, str]) -> SourcePost | N
         # because the visible Post text usually only contains a t.co short URL.
         text = "\n".join([text, *expanded_urls])
 
+    reference_types = {
+        str(item.get("type") or "")
+        for item in (row.get("referenced_tweets") or [])
+        if isinstance(item, dict)
+    }
+    if "replied_to" in reference_types:
+        source_type = "x-reply"
+    elif "quoted" in reference_types:
+        source_type = "x-quote"
+    elif "retweeted" in reference_types:
+        source_type = "x-repost"
+    else:
+        source_type = "x"
+
     return SourcePost(
-        source=f"x:@{username}" if username else "x",
+        source=f"{source_type}:@{username}" if username else source_type,
         text=text,
         url=post_url,
         created_at=parse_x_timestamp(row.get("created_at")),
@@ -124,7 +138,7 @@ class XWatcher(BaseWatcher):
             "query": query,
             "max_results": self.max_results,
             "sort_order": "recency",
-            "tweet.fields": "created_at,author_id,entities",
+            "tweet.fields": "created_at,author_id,entities,referenced_tweets",
             "expansions": "author_id",
             "user.fields": "username",
         }
@@ -280,7 +294,7 @@ class XFilteredStreamWatcher:
 
     async def stream(self):
         params = {
-            "tweet.fields": "created_at,author_id,entities",
+            "tweet.fields": "created_at,author_id,entities,referenced_tweets",
             "expansions": "author_id",
             "user.fields": "username",
         }

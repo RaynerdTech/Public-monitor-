@@ -104,7 +104,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "9.8"
+APP_VERSION = "9.9"
 
 
 def _print_results(results) -> None:

@@ -349,6 +349,9 @@ class PodcastWatcher(BaseWatcher):
         posts: list[SourcePost] = []
         cursor = self._since
         newest_added = cursor
+        published_cutoff = datetime.now(timezone.utc) - timedelta(
+            minutes=self.lookback_minutes
+        )
 
         # Walk a few batches if the index has more than `recent_max` new items.
         # If there is still a backlog, the next watcher cycle continues from the
@@ -394,6 +397,28 @@ class PodcastWatcher(BaseWatcher):
                     continue
                 post = podcast_index_episode_to_post(episode)
                 if post is None or not extract_referral_links(post.text):
+                    continue
+
+                # `recent/data` means recently added to Podcast Index, not
+                # necessarily recently published. An old feed can therefore
+                # suddenly return months of historical episodes. Only alert for
+                # episodes whose real publication time is inside our lookback.
+                if post.created_at is None:
+                    activity(
+                        "source_post_ignored",
+                        source="Podcast / RSS",
+                        reason="missing_publication_time",
+                        episode_id=episode_id,
+                    )
+                    continue
+                if post.created_at < published_cutoff:
+                    activity(
+                        "source_post_ignored",
+                        source="Podcast / RSS",
+                        reason="outside_publication_lookback",
+                        episode_id=episode_id,
+                        published_at=post.created_at.isoformat(),
+                    )
                     continue
 
                 feed_id = str(episode.get("feedId") or item.get("feedId") or "").strip()

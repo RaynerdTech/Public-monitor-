@@ -1,7 +1,11 @@
 import hashlib
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from app.watchers.podcast import (
+    PODCAST_INDEX_RECENT_DATA,
+    PodcastWatcher,
     _parse_feed_timestamp,
     parse_rss_entries,
     podcast_index_auth_headers,
@@ -87,3 +91,71 @@ def test_parse_feed_timestamp_handles_rfc822_and_iso():
     assert _parse_feed_timestamp("Tue, 10 Sep 2026 12:00:00 GMT") is not None
     assert _parse_feed_timestamp("2026-09-10T12:00:00Z") is not None
     assert _parse_feed_timestamp("not-a-date") is None
+
+
+@pytest.mark.anyio
+async def test_recent_index_ignores_old_and_undated_episodes(monkeypatch, tmp_path):
+    now = datetime.now(timezone.utc)
+    watcher = PodcastWatcher(
+        "key",
+        "secret",
+        "ReferralMonitor/0.9",
+        lookback_minutes=30,
+        source_registry_path=str(tmp_path / "podcast-sources.json"),
+    )
+
+    async def fake_api_get(_client, url, *, params=None):
+        assert url == PODCAST_INDEX_RECENT_DATA
+        return {
+            "data": {
+                "items": [
+                    {
+                        "episodeId": "fresh",
+                        "episodeAdded": watcher._since + 1,
+                        "episodeTitle": "Fresh Claude referral",
+                    },
+                    {
+                        "episodeId": "old",
+                        "episodeAdded": watcher._since + 2,
+                        "episodeTitle": "Old Claude referral",
+                    },
+                    {
+                        "episodeId": "undated",
+                        "episodeAdded": watcher._since + 3,
+                        "episodeTitle": "Undated Claude referral",
+                    },
+                ]
+            },
+            "itemCount": 3,
+        }
+
+    episodes = {
+        "fresh": {
+            "id": "fresh",
+            "title": "Fresh",
+            "description": "https://claude.ai/referral/fresh-code",
+            "datePublished": int((now - timedelta(minutes=5)).timestamp()),
+        },
+        "old": {
+            "id": "old",
+            "title": "Old",
+            "description": "https://claude.ai/referral/old-code",
+            "datePublished": int((now - timedelta(days=30)).timestamp()),
+        },
+        "undated": {
+            "id": "undated",
+            "title": "Undated",
+            "description": "https://claude.ai/referral/undated-code",
+        },
+    }
+
+    async def fake_episode_details(_client, episode_id):
+        return episodes[episode_id]
+
+    monkeypatch.setattr(watcher, "_api_get", fake_api_get)
+    monkeypatch.setattr(watcher, "_episode_details", fake_episode_details)
+
+    posts = await watcher._fetch_recent_index(object())
+
+    assert len(posts) == 1
+    assert "fresh-code" in posts[0].text

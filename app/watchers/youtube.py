@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from app.core.activity_log import activity
+from app.core.extractor import extract_referral_links
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -125,16 +126,17 @@ class YouTubeWatcher(BaseWatcher):
         self.overlap_seconds = max(0, int(overlap_seconds))
         self.status_callback = status_callback
         self._seen_video_ids: set[str] = set()
-        self._last_search_at: datetime | None = None
 
     def _status(self, message: str) -> None:
         if self.status_callback:
             self.status_callback(message)
 
     def _published_after(self, now: datetime) -> datetime:
-        if self._last_search_at is None:
-            return now - timedelta(minutes=self.lookback_minutes)
-        return self._last_search_at - timedelta(seconds=self.overlap_seconds)
+        # Always search the complete rolling window. YouTube can publish a video
+        # before it becomes searchable, so using only the previous poll time can
+        # permanently miss a video that was indexed late. In-memory and database
+        # de-duplication prevent repeated alerts from this overlap.
+        return now - timedelta(minutes=self.lookback_minutes)
 
     async def _search(self, client: httpx.AsyncClient, query: str, published_after: datetime) -> list[str]:
         params = {
@@ -195,17 +197,18 @@ class YouTubeWatcher(BaseWatcher):
             for offset in range(0, len(candidate_ids), 50):
                 details.extend(await self._video_details(client, candidate_ids[offset : offset + 50]))
 
-        self._last_search_at = now
-
         posts: list[SourcePost] = []
         for video in details:
             video_id = str(video.get("id") or "").strip()
             if not video_id or video_id in self._seen_video_ids:
                 continue
-            self._seen_video_ids.add(video_id)
             post = youtube_video_to_source_post(video)
-            if post is not None:
-                posts.append(post)
+            if post is None or not extract_referral_links(post.text):
+                # Do not permanently mark the video as seen. Its description may
+                # be edited later, and the rolling window should inspect it again.
+                continue
+            self._seen_video_ids.add(video_id)
+            posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
         activity(
