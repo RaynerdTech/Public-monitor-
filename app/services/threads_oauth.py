@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
 
@@ -17,6 +17,7 @@ THREADS_TOKEN_URL = "https://graph.threads.net/oauth/access_token"
 THREADS_LONG_LIVED_URL = "https://graph.threads.net/access_token"
 THREADS_REFRESH_URL = "https://graph.threads.net/refresh_access_token"
 THREADS_ME_URL = "https://graph.threads.net/v1.0/me"
+RENDER_API_URL = "https://api.render.com/v1"
 
 
 @dataclass
@@ -194,7 +195,7 @@ def fetch_threads_identity(
 def save_threads_token(path: str, record: ThreadsTokenRecord) -> None:
     token_path = Path(path)
     token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(json.dumps(asdict(record), indent=2), encoding="utf-8")
+    token_path.write_text(serialize_threads_token(record, indent=2), encoding="utf-8")
     try:
         os.chmod(token_path, 0o600)
     except OSError:
@@ -206,7 +207,25 @@ def load_threads_token(path: str) -> ThreadsTokenRecord | None:
     if not token_path.exists():
         return None
     try:
-        payload = json.loads(token_path.read_text(encoding="utf-8"))
+        return load_threads_token_value(token_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def serialize_threads_token(
+    record: ThreadsTokenRecord, *, indent: int | None = None
+) -> str:
+    """Serialize a complete token record without ever logging its contents."""
+    separators = None if indent else (",", ":")
+    return json.dumps(asdict(record), indent=indent, separators=separators)
+
+
+def load_threads_token_value(value: str) -> ThreadsTokenRecord | None:
+    """Load a token record from a durable secret/environment variable."""
+    if not value.strip():
+        return None
+    try:
+        payload = json.loads(value)
         if not isinstance(payload, dict):
             return None
         token = str(payload.get("access_token") or "").strip()
@@ -221,8 +240,60 @@ def load_threads_token(path: str) -> ThreadsTokenRecord | None:
             created_at=str(payload.get("created_at") or "").strip() or None,
             refreshed_at=str(payload.get("refreshed_at") or "").strip() or None,
         )
-    except (OSError, ValueError, TypeError):
+    except (ValueError, TypeError):
         return None
+
+
+def persist_threads_token_to_render(
+    *,
+    api_key: str,
+    service_id: str,
+    record: ThreadsTokenRecord,
+    env_var_key: str = "THREADS_TOKEN_RECORD",
+    trigger_deploy: bool = True,
+    timeout_seconds: float = 20,
+    client: httpx.Client | None = None,
+) -> None:
+    """Persist the token in Render's protected environment configuration.
+
+    Render's service filesystem is ephemeral on the free plan. Updating one
+    environment variable keeps the OAuth record across deploys without touching
+    any unrelated variables. A deploy-only release activates the new secret for
+    future process starts without rebuilding the application.
+    """
+    if not api_key.strip():
+        raise ValueError("Render API key is required")
+    if not service_id.strip():
+        raise ValueError("Render service ID is required")
+    if not env_var_key.strip():
+        raise ValueError("Render token environment variable name is required")
+
+    owns_client = client is None
+    active_client = client or httpx.Client(timeout=timeout_seconds, follow_redirects=True)
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Accept": "application/json",
+    }
+    service = quote(service_id.strip(), safe="")
+    env_key = quote(env_var_key.strip(), safe="")
+    try:
+        response = active_client.put(
+            f"{RENDER_API_URL}/services/{service}/env-vars/{env_key}",
+            headers=headers,
+            json={"value": serialize_threads_token(record)},
+        )
+        response.raise_for_status()
+
+        if trigger_deploy:
+            response = active_client.post(
+                f"{RENDER_API_URL}/services/{service}/deploys",
+                headers=headers,
+                json={"deployMode": "deploy_only"},
+            )
+            response.raise_for_status()
+    finally:
+        if owns_client:
+            active_client.close()
 
 
 def create_token_record(

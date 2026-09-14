@@ -46,7 +46,12 @@ from app.config import (
     THREADS_OAUTH_SCOPES,
     THREADS_REDIRECT_URI,
     THREADS_OAUTH_START_KEY,
+    THREADS_RENDER_AUTO_DEPLOY,
+    THREADS_RENDER_API_KEY,
+    THREADS_RENDER_ENV_KEY,
+    THREADS_RENDER_SERVICE_ID,
     THREADS_TOKEN_FILE,
+    THREADS_TOKEN_RECORD,
     THREADS_QUERIES,
     THREADS_SEARCH_LIMIT,
     THREADS_WATCH_INTERVAL_SECONDS,
@@ -78,7 +83,9 @@ from app.services.threads_oauth import (
     exchange_for_long_lived_token,
     fetch_threads_identity,
     load_threads_token,
+    load_threads_token_value,
     new_oauth_state,
+    persist_threads_token_to_render,
     refresh_token_record,
     save_threads_token,
     resolve_threads_redirect_uri,
@@ -104,7 +111,8 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "9.9"
+APP_VERSION = "10.0"
+_threads_persistence_lock = threading.Lock()
 
 
 def _print_results(results) -> None:
@@ -123,7 +131,54 @@ def _print_results(results) -> None:
 
 
 def _threads_token_record():
-    return load_threads_token(THREADS_TOKEN_FILE)
+    # The local record is newest during the OAuth callback/refresh that created
+    # it. On the next Render deployment the ephemeral file is gone and the
+    # durable secret becomes the source of truth.
+    return load_threads_token(THREADS_TOKEN_FILE) or load_threads_token_value(
+        THREADS_TOKEN_RECORD
+    )
+
+
+def _persist_threads_token(record) -> bool:
+    """Save locally for immediate use and durably on Render for future deploys."""
+    save_threads_token(THREADS_TOKEN_FILE, record)
+
+    if not (THREADS_RENDER_API_KEY and THREADS_RENDER_SERVICE_ID):
+        on_render = bool(
+            os.getenv("RENDER")
+            or os.getenv("RENDER_EXTERNAL_URL")
+            or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+        )
+        activity(
+            "threads_token_persisted_locally",
+            durable=not on_render,
+            level="WARNING" if on_render else "INFO",
+        )
+        return not on_render
+
+    try:
+        with _threads_persistence_lock:
+            persist_threads_token_to_render(
+                api_key=THREADS_RENDER_API_KEY,
+                service_id=THREADS_RENDER_SERVICE_ID,
+                record=record,
+                env_var_key=THREADS_RENDER_ENV_KEY,
+                trigger_deploy=THREADS_RENDER_AUTO_DEPLOY,
+            )
+        activity(
+            "threads_token_persisted",
+            backend="render_environment",
+            deploy_queued=THREADS_RENDER_AUTO_DEPLOY,
+        )
+        return True
+    except Exception as exc:
+        activity(
+            "threads_token_persistence_failed",
+            backend="render_environment",
+            error_type=type(exc).__name__,
+            level="ERROR",
+        )
+        return False
 
 
 def _threads_current_token(*, refresh_if_needed: bool = False) -> str:
@@ -138,8 +193,8 @@ def _threads_current_token(*, refresh_if_needed: bool = False) -> str:
         try:
             activity("threads_token_refresh_started")
             record = refresh_token_record(record=record)
-            save_threads_token(THREADS_TOKEN_FILE, record)
-            activity("threads_token_refresh_completed")
+            persisted = _persist_threads_token(record)
+            activity("threads_token_refresh_completed", durable=persisted)
         except Exception as exc:
             # Keep using the still-valid token if a refresh attempt fails.
             activity(
@@ -691,15 +746,28 @@ def threads_web_server() -> None:
                     token_type=token_type,
                     expires_in=expires_in,
                 )
-                save_threads_token(THREADS_TOKEN_FILE, record)
+                persisted = _persist_threads_token(record)
                 display_user = f"@{username}" if username else "Threads account"
+                persistence_message = (
+                    "The authorization was saved and will survive future deployments."
+                    if persisted
+                    else (
+                        "The authorization works now, but durable storage failed. "
+                        "Check the service logs before deploying again."
+                    )
+                )
                 self._send_html(
                     200,
                     "Threads connected",
-                    f"{display_user} was authorized successfully. You can close this page.",
+                    f"{display_user} was authorized successfully. "
+                    f"{persistence_message} You can close this page.",
                 )
                 console.print(f"[green]Threads OAuth completed for {display_user}.[/green]")
-                activity("threads_oauth_completed", username=username)
+                activity(
+                    "threads_oauth_completed",
+                    username=username,
+                    durable=persisted,
+                )
             except Exception as exc:
                 activity(
                     "threads_oauth_token_exchange_failed",
@@ -1672,6 +1740,23 @@ async def _run_threads_hosted() -> None:
                 console.print(
                     "[yellow]Threads watcher waiting for OAuth authorization/token.[/yellow]"
                 )
+                if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+                    message = (
+                        "⚠️ Threads monitor paused\n"
+                        "The Threads authorization is missing or expired. "
+                        "An administrator must reconnect Threads using the protected OAuth link."
+                    )
+                    successful, failures = await send_telegram_message_all(
+                        TELEGRAM_BOT_TOKEN,
+                        TELEGRAM_CHAT_IDS,
+                        message,
+                    )
+                    activity(
+                        "threads_reauthorization_alert_sent",
+                        destinations=len(successful),
+                        failures=len(failures),
+                        level="WARNING",
+                    )
                 last_wait_message = True
             await asyncio.sleep(15)
             continue

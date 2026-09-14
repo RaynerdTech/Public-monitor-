@@ -1,10 +1,15 @@
 from datetime import datetime, timedelta, timezone
 
+import httpx
+
 from app.services.threads_oauth import (
     ThreadsTokenRecord,
     build_threads_authorization_url,
     load_threads_token,
+    load_threads_token_value,
+    persist_threads_token_to_render,
     save_threads_token,
+    serialize_threads_token,
 )
 
 
@@ -52,6 +57,51 @@ def test_threads_token_store_round_trip(tmp_path):
     assert loaded.user_id == "99"
     assert loaded.username == "tester"
     assert not loaded.is_expired()
+
+
+def test_threads_token_environment_record_round_trip():
+    record = ThreadsTokenRecord(
+        access_token="secret-token",
+        user_id="99",
+        username="tester",
+        expires_at=(datetime.now(timezone.utc) + timedelta(days=60)).isoformat(),
+    )
+
+    loaded = load_threads_token_value(serialize_threads_token(record))
+
+    assert loaded is not None
+    assert loaded.access_token == "secret-token"
+    assert loaded.user_id == "99"
+    assert loaded.username == "tester"
+
+
+def test_persist_threads_token_to_render_updates_one_secret_and_queues_deploy():
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200 if request.method == "PUT" else 201, json={})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    record = ThreadsTokenRecord(access_token="secret-token", user_id="99")
+    try:
+        persist_threads_token_to_render(
+            api_key="render-api-key",
+            service_id="srv-test",
+            record=record,
+            client=client,
+        )
+    finally:
+        client.close()
+
+    assert [request.method for request in requests] == ["PUT", "POST"]
+    assert requests[0].url.path == (
+        "/v1/services/srv-test/env-vars/THREADS_TOKEN_RECORD"
+    )
+    assert requests[0].headers["authorization"] == "Bearer render-api-key"
+    assert b"secret-token" in requests[0].content
+    assert requests[1].url.path == "/v1/services/srv-test/deploys"
+    assert requests[1].content == b'{"deployMode":"deploy_only"}'
 
 
 def test_resolve_threads_redirect_uri_from_railway_domain():
