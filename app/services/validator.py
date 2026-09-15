@@ -11,6 +11,7 @@ from app.config import (
     VALIDATION_RETRIES,
     VALIDATION_TIMEOUT_SECONDS,
     VALIDATOR_BROWSER_FALLBACK_ENABLED,
+    VALIDATOR_PROXY_URL,
 )
 
 
@@ -203,15 +204,24 @@ def _retry_after_seconds(value: str | None) -> float | None:
     return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
-async def _validate_direct(code: str) -> ValidationResult:
+async def _validate_json_api(
+    code: str,
+    *,
+    method: str,
+    proxy_url: str | None = None,
+) -> ValidationResult:
     url = f"https://claude.ai/api/referral/code/{code}"
     last_error: str | None = None
 
-    async with httpx.AsyncClient(
-        timeout=VALIDATION_TIMEOUT_SECONDS,
-        follow_redirects=True,
-        headers=_HEADERS,
-    ) as client:
+    client_options = {
+        "timeout": VALIDATION_TIMEOUT_SECONDS,
+        "follow_redirects": True,
+        "headers": _HEADERS,
+    }
+    if proxy_url:
+        client_options["proxy"] = proxy_url
+
+    async with httpx.AsyncClient(**client_options) as client:
         for attempt in range(VALIDATION_RETRIES):
             response: httpx.Response | None = None
             try:
@@ -220,10 +230,10 @@ async def _validate_direct(code: str) -> ValidationResult:
                     response.status_code,
                     response.text,
                     response.headers.get("content-type", ""),
-                    method="direct",
+                    method=method,
                 )
 
-                # A 403 should move to the optional browser fallback immediately.
+                # A 403 should move to the next configured fallback immediately.
                 if result.status == "blocked":
                     return result
                 if result.status != "error":
@@ -231,7 +241,11 @@ async def _validate_direct(code: str) -> ValidationResult:
 
                 last_error = result.message
             except httpx.HTTPError as exc:
-                last_error = str(exc)
+                last_error = (
+                    f"Proxy request failed: {type(exc).__name__}"
+                    if proxy_url
+                    else str(exc)
+                )
 
             if attempt + 1 < VALIDATION_RETRIES:
                 retry_after = _retry_after_seconds(
@@ -245,14 +259,41 @@ async def _validate_direct(code: str) -> ValidationResult:
     return ValidationResult(
         status="error",
         message=last_error or "Validation request failed",
-        method="direct",
+        method=method,
+    )
+
+
+async def _validate_direct(code: str) -> ValidationResult:
+    return await _validate_json_api(code, method="direct")
+
+
+async def _validate_proxy(code: str) -> ValidationResult:
+    if not VALIDATOR_PROXY_URL:
+        return ValidationResult(
+            status="blocked",
+            message="No clean proxy configured",
+            method="proxy",
+        )
+    return await _validate_json_api(
+        code,
+        method="proxy",
+        proxy_url=VALIDATOR_PROXY_URL,
     )
 
 
 async def validate_referral(code: str) -> ValidationResult:
     direct = await _validate_direct(code)
-    if direct.status != "blocked" or not VALIDATOR_BROWSER_FALLBACK_ENABLED:
+    if direct.status != "blocked":
         return direct
+
+    fallback_result = direct
+    if VALIDATOR_PROXY_URL:
+        fallback_result = await _validate_proxy(code)
+        if fallback_result.status != "blocked":
+            return fallback_result
+
+    if not VALIDATOR_BROWSER_FALLBACK_ENABLED:
+        return fallback_result
 
     from app.services.browser_validator import fetch_referral_api_in_browser
 

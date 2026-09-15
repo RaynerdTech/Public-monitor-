@@ -105,10 +105,16 @@ async def init_db() -> None:
                 next_attempt_at TEXT,
                 last_error TEXT,
                 sent_at TEXT,
+                message_id INTEGER,
                 UNIQUE(referral_code, chat_id)
             )
             """
         )
+        delivery_columns = await _column_names(db, "telegram_deliveries")
+        if "message_id" not in delivery_columns:
+            await db.execute(
+                "ALTER TABLE telegram_deliveries ADD COLUMN message_id INTEGER"
+            )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_telegram_delivery_queue "
             "ON telegram_deliveries(status, next_attempt_at)"
@@ -302,7 +308,7 @@ async def get_due_telegram_deliveries(limit: int = 50) -> list[dict]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
             """
-            SELECT d.id AS delivery_id, d.referral_code, d.chat_id,
+            SELECT d.id AS delivery_id, d.referral_code, d.chat_id, d.message_id,
                    d.status AS delivery_status, d.attempts,
                    r.referral_url, r.source, r.source_url,
                    r.post_created_at, r.detected_at, r.campaign,
@@ -326,6 +332,7 @@ async def record_telegram_delivery(
     sent: bool,
     error: str | None = None,
     retry_after_seconds: int | None = None,
+    message_id: int | None = None,
 ) -> int:
     now = datetime.now(timezone.utc)
     next_attempt_at = (
@@ -338,7 +345,8 @@ async def record_telegram_delivery(
             """
             UPDATE telegram_deliveries
             SET status = ?, attempts = attempts + 1,
-                next_attempt_at = ?, last_error = ?, sent_at = ?
+                next_attempt_at = ?, last_error = ?, sent_at = ?,
+                message_id = COALESCE(?, message_id)
             WHERE id = ?
             """,
             (
@@ -346,6 +354,7 @@ async def record_telegram_delivery(
                 next_attempt_at,
                 None if sent else error,
                 now.isoformat() if sent else None,
+                message_id,
                 delivery_id,
             ),
         )
@@ -356,6 +365,24 @@ async def record_telegram_delivery(
         row = await cursor.fetchone()
         await db.commit()
         return int(row[0]) if row else 0
+
+
+async def get_sent_telegram_deliveries(referral_code: str) -> list[dict]:
+    """Return sent Telegram alerts that can be updated after validation."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT id AS delivery_id, referral_code, chat_id, message_id
+            FROM telegram_deliveries
+            WHERE referral_code = ?
+              AND status = 'sent'
+              AND message_id IS NOT NULL
+            """,
+            (referral_code,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
 async def get_referral_by_code(referral_code: str) -> dict | None:

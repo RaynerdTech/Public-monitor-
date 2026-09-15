@@ -159,6 +159,61 @@ async def test_failed_telegram_delivery_remains_retryable(
 
 
 @pytest.mark.anyio
+async def test_pending_telegram_alert_is_updated_after_validation(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(database, "DB_PATH", tmp_path / "status-update.db")
+    monkeypatch.setattr(retry_queue, "TELEGRAM_BOT_TOKEN", "bot-token")
+    monkeypatch.setattr(retry_queue, "TELEGRAM_CHAT_IDS", ["chat-1"])
+
+    candidate = ReferralCandidate(
+        referral_url="https://claude.ai/referral/status-code",
+        referral_code="status-code",
+        source="threads:@tester",
+    )
+    await database.init_db()
+    await database.save_referral(candidate)
+    await database.ensure_telegram_deliveries("status-code", ["chat-1"])
+
+    async def send(*_args, **_kwargs) -> int:
+        return 321
+
+    edits: list[str] = []
+
+    async def edit(
+        _token: str,
+        _chat_id: str,
+        _message_id: int,
+        text: str,
+        **_kwargs,
+    ) -> None:
+        edits.append(text)
+
+    async def valid(_code: str) -> ValidationResult:
+        return ValidationResult(
+            status="valid",
+            campaign="claude_code_guest_pass",
+            is_valid=True,
+            method="proxy",
+        )
+
+    monkeypatch.setattr(retry_queue, "send_telegram_message", send)
+    monkeypatch.setattr(retry_queue, "edit_telegram_message", edit)
+    monkeypatch.setattr(retry_queue, "validate_referral", valid)
+
+    delivery = (await database.get_due_telegram_deliveries())[0]
+    assert await retry_queue.deliver_queued_telegram(delivery) is True
+
+    validation_row = (await database.get_due_validation_referrals())[0]
+    await retry_queue.validate_queued_referral(validation_row)
+
+    assert len(edits) == 1
+    assert "Looks active" in edits[0]
+    sent = await database.get_sent_telegram_deliveries("status-code")
+    assert sent[0]["message_id"] == 321
+
+
+@pytest.mark.anyio
 async def test_authorized_telegram_feedback_is_saved_and_message_is_updated(
     tmp_path: Path, monkeypatch
 ):

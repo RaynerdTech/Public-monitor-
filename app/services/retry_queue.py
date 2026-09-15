@@ -18,6 +18,7 @@ from app.config import (
 from app.core.activity_log import activity
 from app.core.database import (
     ensure_telegram_deliveries,
+    get_sent_telegram_deliveries,
     get_referral_by_code,
     get_due_telegram_deliveries,
     get_due_validation_referrals,
@@ -58,6 +59,50 @@ def _parse_datetime(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _candidate_from_row(row: dict) -> ReferralCandidate:
+    return ReferralCandidate(
+        referral_url=str(row["referral_url"]),
+        referral_code=str(row["referral_code"]),
+        source=str(row["source"]),
+        source_url=row.get("source_url"),
+        post_created_at=_parse_datetime(row.get("post_created_at")),
+        detected_at=_parse_datetime(row.get("detected_at"))
+        or datetime.now(timezone.utc),
+    )
+
+
+async def _update_sent_alerts(row: dict, result: ValidationResult) -> None:
+    if not TELEGRAM_BOT_TOKEN or result.status == "pending":
+        return
+
+    code = str(row["referral_code"])
+    candidate = _candidate_from_row(row)
+    deliveries = await get_sent_telegram_deliveries(code)
+    for delivery in deliveries:
+        try:
+            await edit_telegram_message(
+                TELEGRAM_BOT_TOKEN,
+                str(delivery["chat_id"]),
+                int(delivery["message_id"]),
+                format_referral_alert(candidate, result),
+                reply_markup=format_referral_keyboard(candidate),
+            )
+            activity(
+                "telegram_validation_status_updated",
+                referral_code=code,
+                destination=str(delivery["chat_id"]),
+                validation_status=result.status,
+            )
+        except Exception as exc:
+            activity(
+                "telegram_validation_status_update_failed",
+                referral_code=code,
+                destination=str(delivery["chat_id"]),
+                error_type=type(exc).__name__,
+                level="ERROR",
+            )
 
 
 async def validate_queued_referral(row: dict) -> ValidationResult:
@@ -127,6 +172,8 @@ async def validate_queued_referral(row: dict) -> ValidationResult:
             level="WARNING",
         )
 
+    await _update_sent_alerts(row, result)
+
     if result.status == "valid":
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
             await ensure_telegram_deliveries(code, TELEGRAM_CHAT_IDS)
@@ -164,15 +211,7 @@ async def deliver_queued_telegram(row: dict) -> bool:
         attempt=prior_attempts + 1,
     )
 
-    candidate = ReferralCandidate(
-        referral_url=str(row["referral_url"]),
-        referral_code=code,
-        source=str(row["source"]),
-        source_url=row.get("source_url"),
-        post_created_at=_parse_datetime(row.get("post_created_at")),
-        detected_at=_parse_datetime(row.get("detected_at"))
-        or datetime.now(timezone.utc),
-    )
+    candidate = _candidate_from_row(row)
     result = ValidationResult(
         status=str(row.get("validation_status") or "pending"),
         campaign=row.get("campaign"),
@@ -180,7 +219,7 @@ async def deliver_queued_telegram(row: dict) -> bool:
     )
 
     try:
-        await send_telegram_message(
+        message_id = await send_telegram_message(
             TELEGRAM_BOT_TOKEN,
             chat_id,
             format_referral_alert(candidate, result),
@@ -209,13 +248,30 @@ async def deliver_queued_telegram(row: dict) -> bool:
         )
         return False
 
-    attempts = await record_telegram_delivery(delivery_id, sent=True)
+    attempts = await record_telegram_delivery(
+        delivery_id,
+        sent=True,
+        message_id=message_id,
+    )
     activity(
         "telegram_delivery_sent",
         referral_code=code,
         destination=chat_id,
         attempt=attempts,
     )
+
+    # Close the race where validation finishes after this delivery row was
+    # selected but before the pending Telegram message was actually sent.
+    latest = await get_referral_by_code(code)
+    if latest and latest.get("status") != result.status:
+        latest_result = ValidationResult(
+            status=str(latest.get("status") or "pending"),
+            campaign=latest.get("campaign"),
+            is_valid=True if latest.get("status") == "valid" else None,
+            message=latest.get("validation_message"),
+            method="stored",
+        )
+        await _update_sent_alerts(latest, latest_result)
     return True
 
 

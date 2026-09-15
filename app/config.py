@@ -29,6 +29,7 @@ VALIDATION_RETRIES = max(1, int(os.getenv("VALIDATION_RETRIES", "2")))
 VALIDATION_MIN_GAP_SECONDS = max(
     0.0, float(os.getenv("VALIDATION_MIN_GAP_SECONDS", "1.0"))
 )
+VALIDATOR_PROXY_URL = os.getenv("VALIDATOR_PROXY_URL", "").strip() or None
 VALIDATION_QUEUE_POLL_SECONDS = max(
     1, int(os.getenv("VALIDATION_QUEUE_POLL_SECONDS", "2"))
 )

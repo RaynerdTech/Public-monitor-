@@ -111,7 +111,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.1"
+APP_VERSION = "10.2"
 _threads_persistence_lock = threading.Lock()
 
 

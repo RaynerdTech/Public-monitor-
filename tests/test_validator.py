@@ -138,3 +138,64 @@ async def test_browser_fallback_used_after_cloudflare(monkeypatch):
 
     assert result.status == "valid"
     assert result.method == "browser"
+
+
+@pytest.mark.anyio
+async def test_clean_proxy_retries_same_json_endpoint_after_direct_403(monkeypatch):
+    async def fake_direct(_code):
+        return ValidationResult(status="blocked", method="direct")
+
+    async def fake_proxy(_code):
+        return ValidationResult(
+            status="valid",
+            campaign="claude_code_guest_pass",
+            is_valid=True,
+            method="proxy",
+        )
+
+    monkeypatch.setattr(validator, "_validate_direct", fake_direct)
+    monkeypatch.setattr(validator, "_validate_proxy", fake_proxy)
+    monkeypatch.setattr(validator, "VALIDATOR_PROXY_URL", "http://proxy.test:8080")
+    monkeypatch.setattr(validator, "VALIDATOR_BROWSER_FALLBACK_ENABLED", False)
+
+    result = await validator.validate_referral("abc123")
+
+    assert result.status == "valid"
+    assert result.method == "proxy"
+
+
+@pytest.mark.anyio
+async def test_proxy_request_uses_json_api_without_opening_referral_page(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"campaign":"claude_code_guest_pass","is_valid":true}'
+        headers = {"content-type": "application/json"}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url):
+            captured["url"] = url
+            return FakeResponse()
+
+    monkeypatch.setattr(validator.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(validator, "VALIDATION_MIN_GAP_SECONDS", 0)
+
+    result = await validator._validate_json_api(
+        "abc123",
+        method="proxy",
+        proxy_url="http://proxy.test:8080",
+    )
+
+    assert captured["proxy"] == "http://proxy.test:8080"
+    assert captured["url"] == "https://claude.ai/api/referral/code/abc123"
+    assert result.status == "valid"
