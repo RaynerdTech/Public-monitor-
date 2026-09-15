@@ -26,6 +26,9 @@ TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
 DATABASE_PATH = os.getenv("DATABASE_PATH", "referrals.db").strip() or "referrals.db"
 VALIDATION_TIMEOUT_SECONDS = float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "10"))
 VALIDATION_RETRIES = max(1, int(os.getenv("VALIDATION_RETRIES", "2")))
+VALIDATION_MIN_GAP_SECONDS = max(
+    0.0, float(os.getenv("VALIDATION_MIN_GAP_SECONDS", "1.0"))
+)
 VALIDATION_QUEUE_POLL_SECONDS = max(
     1, int(os.getenv("VALIDATION_QUEUE_POLL_SECONDS", "2"))
 )

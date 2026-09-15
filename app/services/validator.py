@@ -1,10 +1,13 @@
 import asyncio
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import httpx
 
 from app.config import (
+    VALIDATION_MIN_GAP_SECONDS,
     VALIDATION_RETRIES,
     VALIDATION_TIMEOUT_SECONDS,
     VALIDATOR_BROWSER_FALLBACK_ENABLED,
@@ -30,6 +33,44 @@ _HEADERS = {
     ),
 }
 
+_GUEST_PASS_CAMPAIGNS = {
+    "claude_code_guest_pass",
+    "claude_code_guest_pass_a47c",
+}
+
+
+class _DirectRequestGate:
+    """Serialize Claude API requests and leave a small gap between starts."""
+
+    def __init__(self) -> None:
+        self._loop = None
+        self._lock: asyncio.Lock | None = None
+        self._last_finished_at = 0.0
+
+    def _state(self) -> tuple[asyncio.AbstractEventLoop, asyncio.Lock]:
+        loop = asyncio.get_running_loop()
+        if self._loop is not loop or self._lock is None:
+            self._loop = loop
+            self._lock = asyncio.Lock()
+            self._last_finished_at = 0.0
+        return loop, self._lock
+
+    async def get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
+        loop, lock = self._state()
+        async with lock:
+            remaining = VALIDATION_MIN_GAP_SECONDS - (
+                loop.time() - self._last_finished_at
+            )
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            try:
+                return await client.get(url)
+            finally:
+                self._last_finished_at = loop.time()
+
+
+_DIRECT_REQUEST_GATE = _DirectRequestGate()
+
 
 def classify_referral_payload(data, *, method: str = "direct") -> ValidationResult:
     if data is None:
@@ -46,24 +87,32 @@ def classify_referral_payload(data, *, method: str = "direct") -> ValidationResu
             method=method,
         )
 
-    campaign = data.get("campaign")
+    raw_campaign = data.get("campaign")
+    campaign = raw_campaign if isinstance(raw_campaign, str) else None
     is_valid = data.get("is_valid")
 
-    if campaign == "claude_code_guest_pass_a47c" and is_valid is True:
+    if campaign in _GUEST_PASS_CAMPAIGNS and is_valid is True:
         status = "valid"
     elif campaign == "claude_invite_contest" and is_valid is True:
         status = "contest"
     elif is_valid is False:
         status = "inactive"
-    elif is_valid is True:
-        status = "valid"
+    elif is_valid is True and campaign:
+        # Claude uses this endpoint for other campaigns too. A true result from
+        # one of those campaigns is not a usable Claude Code guest pass.
+        status = "contest"
     else:
         status = "unknown"
+
+    message = None
+    if status == "contest" and campaign != "claude_invite_contest":
+        message = f"Non-guest-pass campaign: {campaign}"
 
     return ValidationResult(
         status=status,
         campaign=campaign,
         is_valid=is_valid,
+        message=message,
         raw=data,
         method=method,
     )
@@ -99,10 +148,30 @@ def _classify_http_response(
             method=method,
         )
 
+    if status_code == 403:
+        return ValidationResult(
+            status="blocked",
+            message="HTTP 403 access blocked",
+            method=method,
+        )
+
+    if status_code == 404:
+        return ValidationResult(
+            status="not_found",
+            message="Referral not found",
+            method=method,
+        )
+
     if status_code != 200:
         return ValidationResult(
             status="error",
-            message=f"HTTP {status_code}" if status_code else "Validation request failed",
+            message=(
+                "HTTP 429 rate limited"
+                if status_code == 429
+                else f"HTTP {status_code}"
+                if status_code
+                else "Validation request failed"
+            ),
             method=method,
         )
 
@@ -118,38 +187,60 @@ def _classify_http_response(
     return classify_referral_payload(data, method=method)
 
 
+def _retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value.strip()))
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+
+
 async def _validate_direct(code: str) -> ValidationResult:
     url = f"https://claude.ai/api/referral/code/{code}"
     last_error: str | None = None
 
-    for attempt in range(VALIDATION_RETRIES):
-        try:
-            async with httpx.AsyncClient(
-                timeout=VALIDATION_TIMEOUT_SECONDS,
-                follow_redirects=True,
-                headers=_HEADERS,
-            ) as client:
-                response = await client.get(url)
+    async with httpx.AsyncClient(
+        timeout=VALIDATION_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        headers=_HEADERS,
+    ) as client:
+        for attempt in range(VALIDATION_RETRIES):
+            response: httpx.Response | None = None
+            try:
+                response = await _DIRECT_REQUEST_GATE.get(client, url)
+                result = _classify_http_response(
+                    response.status_code,
+                    response.text,
+                    response.headers.get("content-type", ""),
+                    method="direct",
+                )
 
-            result = _classify_http_response(
-                response.status_code,
-                response.text,
-                response.headers.get("content-type", ""),
-                method="direct",
-            )
+                # A 403 should move to the optional browser fallback immediately.
+                if result.status == "blocked":
+                    return result
+                if result.status != "error":
+                    return result
 
-            # Do not keep hammering Claude when Cloudflare has explicitly challenged us.
-            if result.status == "blocked":
-                return result
-            if result.status != "error":
-                return result
+                last_error = result.message
+            except httpx.HTTPError as exc:
+                last_error = str(exc)
 
-            last_error = result.message
-        except httpx.HTTPError as exc:
-            last_error = str(exc)
-
-        if attempt + 1 < VALIDATION_RETRIES:
-            await asyncio.sleep(0.75 * (attempt + 1))
+            if attempt + 1 < VALIDATION_RETRIES:
+                retry_after = _retry_after_seconds(
+                    response.headers.get("retry-after")
+                    if response is not None
+                    else None
+                )
+                delay = retry_after if retry_after is not None else 0.75 * (attempt + 1)
+                await asyncio.sleep(min(30.0, max(0.0, delay)))
 
     return ValidationResult(
         status="error",

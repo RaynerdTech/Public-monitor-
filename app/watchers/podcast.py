@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import html
 import json
+import re
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,9 @@ PODCAST_INDEX_RECENT_DATA = f"{PODCAST_INDEX_BASE_URL}/recent/data"
 PODCAST_INDEX_SEARCH_BYTERM = f"{PODCAST_INDEX_BASE_URL}/search/byterm"
 PODCAST_INDEX_EPISODE_BYID = f"{PODCAST_INDEX_BASE_URL}/episodes/byid"
 PODCAST_INDEX_PODCAST_BYFEEDID = f"{PODCAST_INDEX_BASE_URL}/podcasts/byfeedid"
+
+
+_URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 
 
 def podcast_index_auth_headers(
@@ -58,6 +62,9 @@ def _strip_html(value: object) -> str:
     if not isinstance(value, str):
         return ""
     text = html.unescape(value)
+    # Preserve URLs stored only in attributes such as <a href="...">. A plain
+    # tag stripper would otherwise remove the exact referral we need to detect.
+    embedded_urls = [url.rstrip(".,);]}") for url in _URL_RE.findall(text)]
     # Podcast descriptions are frequently HTML. ElementTree is too strict for
     # arbitrary fragments, so use a small tag stripper after unescaping.
     out: list[str] = []
@@ -71,7 +78,28 @@ def _strip_html(value: object) -> str:
             out.append(" ")
         elif not inside:
             out.append(char)
-    return " ".join("".join(out).split())
+    plain = " ".join("".join(out).split())
+    return "\n".join(part for part in (plain, *embedded_urls) if part)
+
+
+def _episode_transcript_urls(episode: dict) -> list[str]:
+    candidates: list[object] = [episode.get("transcriptUrl")]
+    transcripts = episode.get("transcripts")
+    if isinstance(transcripts, list):
+        for transcript in transcripts:
+            if isinstance(transcript, str):
+                candidates.append(transcript)
+            elif isinstance(transcript, dict):
+                candidates.append(transcript.get("url"))
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        url = str(candidate or "").strip()
+        if url.lower().startswith(("http://", "https://")) and url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 def podcast_index_episode_to_post(episode: dict) -> SourcePost | None:
@@ -84,10 +112,13 @@ def podcast_index_episode_to_post(episode: dict) -> SourcePost | None:
     feed_title = str(episode.get("feedTitle") or "").strip() or "unknown"
     link = str(episode.get("link") or "").strip()
     enclosure = str(episode.get("enclosureUrl") or "").strip()
+    transcript_urls = _episode_transcript_urls(episode)
 
     return SourcePost(
         source=f"podcast:{feed_title}",
-        text="\n".join(part for part in (title, description) if part),
+        text="\n".join(
+            part for part in (title, description, link, *transcript_urls) if part
+        ),
         url=link or enclosure or None,
         created_at=_epoch_datetime(episode.get("datePublished")),
     )
@@ -170,9 +201,7 @@ def parse_rss_entries(xml_text: str, feed_url: str) -> list[tuple[str, SourcePos
             elif name in {"pubdate", "published", "updated"} and not published:
                 published = _node_text(child).strip()
 
-        text = "\n".join(
-            part for part in [title, *description_parts] if part
-        )
+        text = "\n".join(part for part in [title, *description_parts, link] if part)
         identity = guid or link or f"{feed_url}|{title}|{published}"
         entries.append(
             (
@@ -228,6 +257,12 @@ class PodcastWatcher(BaseWatcher):
         self._seen_episode_ids: set[str] = set()
         self._seen_rss_entries: set[str] = set()
         self._rss_bootstrapped_feeds: set[str] = set()
+        self._rss_validators: dict[str, dict[str, str]] = {}
+        self._last_index_scanned = 0
+        self._last_index_relevant = 0
+        self._last_recent_feeds_promoted = 0
+        self._last_transcripts_checked = 0
+        self._last_rss_polled = 0
         self._feeds: dict[str, dict] = self._load_registry()
 
     def _status(self, message: str) -> None:
@@ -239,7 +274,13 @@ class PodcastWatcher(BaseWatcher):
         except (OSError, ValueError, TypeError):
             return {}
         feeds = payload.get("feeds") if isinstance(payload, dict) else None
-        return feeds if isinstance(feeds, dict) else {}
+        if not isinstance(feeds, dict):
+            return {}
+        return {
+            str(url): metadata
+            for url, metadata in feeds.items()
+            if isinstance(metadata, dict)
+        }
 
     def _save_registry(self) -> None:
         payload = {"feeds": self._feeds}
@@ -257,18 +298,28 @@ class PodcastWatcher(BaseWatcher):
         title: str = "",
         feed_id: str = "",
         reason: str,
-    ) -> None:
+        save: bool = True,
+    ) -> bool:
         url = feed_url.strip()
         if not url:
-            return
+            return False
         existing = self._feeds.get(url, {})
-        self._feeds[url] = {
+        existing_reason = str(existing.get("reason") or "")
+        selected_reason = reason or existing_reason
+        if existing_reason.startswith("Produced a Claude referral"):
+            selected_reason = existing_reason
+        updated = {
             "title": title or existing.get("title", ""),
             "feed_id": feed_id or existing.get("feed_id", ""),
-            "reason": reason or existing.get("reason", ""),
+            "reason": selected_reason,
             "added_at": existing.get("added_at") or datetime.now(timezone.utc).isoformat(),
         }
-        self._save_registry()
+        if updated == existing:
+            return False
+        self._feeds[url] = updated
+        if save:
+            self._save_registry()
+        return True
 
     async def _api_get(
         self,
@@ -292,6 +343,7 @@ class PodcastWatcher(BaseWatcher):
         if not self.discovery_queries:
             return
         for query in self.discovery_queries:
+            changed = False
             payload = await self._api_get(
                 client,
                 PODCAST_INDEX_SEARCH_BYTERM,
@@ -306,12 +358,15 @@ class PodcastWatcher(BaseWatcher):
                 feed_url = str(feed.get("url") or "").strip()
                 if not feed_url:
                     continue
-                self._promote_feed(
+                changed = self._promote_feed(
                     feed_url,
                     title=str(feed.get("title") or ""),
                     feed_id=str(feed.get("id") or ""),
                     reason=f"Podcast Index discovery: {query}",
-                )
+                    save=False,
+                ) or changed
+            if changed:
+                self._save_registry()
 
     async def _episode_details(
         self, client: httpx.AsyncClient, episode_id: str
@@ -345,8 +400,57 @@ class PodcastWatcher(BaseWatcher):
             for token in ("claude", "anthropic", "guest pass", "referral")
         )
 
+    async def _fetch_episode_transcripts(
+        self, client: httpx.AsyncClient, episode: dict
+    ) -> str:
+        """Fetch the small set of transcript files advertised by Podcast Index."""
+        bodies: list[str] = []
+        headers = {
+            "User-Agent": self.user_agent,
+            "Accept": (
+                "application/json,application/srt,text/vtt,text/srt,text/plain,text/html,*/*"
+            ),
+        }
+        for url in _episode_transcript_urls(episode)[:3]:
+            self._last_transcripts_checked += 1
+            try:
+                response = await client.get(url, headers=headers, follow_redirects=True)
+                response.raise_for_status()
+            except httpx.HTTPError as exc:
+                activity(
+                    "podcast_transcript_fetch_failed",
+                    source="Podcast / RSS",
+                    url=url,
+                    error_type=type(exc).__name__,
+                    level="WARNING",
+                )
+                continue
+
+            content_type = (response.headers.get("content-type") or "").lower()
+            if content_type and not any(
+                marker in content_type
+                for marker in ("json", "text/", "application/srt", "application/xml")
+            ):
+                continue
+            body = response.text[:1_500_000]
+            bodies.append(body)
+            if "json" in content_type:
+                # Decoding JSON turns escaped `\/` URL separators back into `/`,
+                # allowing the normal referral extractor to see transcript links.
+                try:
+                    decoded = response.json()
+                except ValueError:
+                    pass
+                else:
+                    bodies.append(json.dumps(decoded, ensure_ascii=False)[:1_500_000])
+        return "\n".join(bodies)
+
     async def _fetch_recent_index(self, client: httpx.AsyncClient) -> list[SourcePost]:
         posts: list[SourcePost] = []
+        self._last_index_scanned = 0
+        self._last_index_relevant = 0
+        self._last_recent_feeds_promoted = 0
+        self._last_transcripts_checked = 0
         cursor = self._since
         newest_added = cursor
         published_cutoff = datetime.now(timezone.utc) - timedelta(
@@ -366,6 +470,36 @@ class PodcastWatcher(BaseWatcher):
             items = data.get("items") if isinstance(data, dict) else []
             if not isinstance(items, list):
                 items = []
+            feeds = data.get("feeds") if isinstance(data, dict) else []
+            if not isinstance(feeds, list):
+                feeds = []
+
+            registry_changed = False
+            for feed in feeds:
+                if not isinstance(feed, dict):
+                    continue
+                feed_summary = "\n".join(
+                    part
+                    for part in (
+                        str(feed.get("feedTitle") or "").strip(),
+                        _strip_html(feed.get("feedDescription")),
+                    )
+                    if part
+                )
+                if not self._has_relevant_hint(feed_summary):
+                    continue
+                promoted = self._promote_feed(
+                    str(feed.get("feedUrl") or ""),
+                    title=str(feed.get("feedTitle") or ""),
+                    feed_id=str(feed.get("feedId") or ""),
+                    reason="Recent Podcast Index metadata",
+                    save=False,
+                )
+                registry_changed = promoted or registry_changed
+                if promoted:
+                    self._last_recent_feeds_promoted += 1
+            if registry_changed:
+                self._save_registry()
 
             for item in items:
                 if not isinstance(item, dict):
@@ -373,7 +507,7 @@ class PodcastWatcher(BaseWatcher):
                 episode_id = str(item.get("episodeId") or "").strip()
                 if not episode_id or episode_id in self._seen_episode_ids:
                     continue
-                self._seen_episode_ids.add(episode_id)
+                self._last_index_scanned += 1
 
                 try:
                     added = int(item.get("episodeAdded") or 0)
@@ -390,13 +524,27 @@ class PodcastWatcher(BaseWatcher):
                     if part
                 )
                 if not self._has_relevant_hint(summary):
+                    self._seen_episode_ids.add(episode_id)
                     continue
+                self._last_index_relevant += 1
 
                 episode = await self._episode_details(client, episode_id)
                 if not episode:
+                    self._seen_episode_ids.add(episode_id)
                     continue
                 post = podcast_index_episode_to_post(episode)
-                if post is None or not extract_referral_links(post.text):
+                if post is None:
+                    self._seen_episode_ids.add(episode_id)
+                    continue
+
+                if not extract_referral_links(post.text):
+                    transcript_text = await self._fetch_episode_transcripts(
+                        client, episode
+                    )
+                    if transcript_text:
+                        post.text = f"{post.text}\n{transcript_text}"
+                if not extract_referral_links(post.text):
+                    self._seen_episode_ids.add(episode_id)
                     continue
 
                 # `recent/data` means recently added to Podcast Index, not
@@ -410,6 +558,7 @@ class PodcastWatcher(BaseWatcher):
                         reason="missing_publication_time",
                         episode_id=episode_id,
                     )
+                    self._seen_episode_ids.add(episode_id)
                     continue
                 if post.created_at < published_cutoff:
                     activity(
@@ -419,10 +568,21 @@ class PodcastWatcher(BaseWatcher):
                         episode_id=episode_id,
                         published_at=post.created_at.isoformat(),
                     )
+                    self._seen_episode_ids.add(episode_id)
                     continue
 
                 feed_id = str(episode.get("feedId") or item.get("feedId") or "").strip()
-                feed = await self._feed_details(client, feed_id)
+                try:
+                    feed = await self._feed_details(client, feed_id)
+                except httpx.HTTPError as exc:
+                    feed = None
+                    activity(
+                        "podcast_feed_lookup_failed",
+                        source="Podcast / RSS",
+                        feed_id=feed_id,
+                        error_type=type(exc).__name__,
+                        level="WARNING",
+                    )
                 if feed:
                     self._promote_feed(
                         str(feed.get("url") or ""),
@@ -431,6 +591,7 @@ class PodcastWatcher(BaseWatcher):
                         reason="Produced a Claude referral",
                     )
                 posts.append(post)
+                self._seen_episode_ids.add(episode_id)
 
             try:
                 next_since = int(payload.get("nextSince") or 0)
@@ -455,45 +616,105 @@ class PodcastWatcher(BaseWatcher):
             self._since = max(self._since, int(time.time()) - 5)
         return posts
 
-    async def _fetch_rss(self) -> list[SourcePost]:
-        if not self._feeds:
+    def _rss_feed_urls(self) -> list[str]:
+        # Give feeds that previously produced a referral priority when the registry
+        # is larger than the configured poll limit.
+        def sort_key(url: str) -> tuple[int, float, str]:
+            metadata = self._feeds.get(url, {})
+            reason = str(metadata.get("reason") or "")
+            try:
+                added_at = datetime.fromisoformat(
+                    str(metadata.get("added_at") or "").replace("Z", "+00:00")
+                ).timestamp()
+            except (TypeError, ValueError):
+                added_at = 0.0
+            return (
+                0 if reason.startswith("Produced a Claude referral") else 1,
+                -added_at,
+                url,
+            )
+
+        return sorted(self._feeds, key=sort_key)[: self.rss_max_feeds]
+
+    async def _fetch_rss_feed(
+        self,
+        client: httpx.AsyncClient,
+        feed_url: str,
+        cutoff: datetime,
+        semaphore: asyncio.Semaphore,
+    ) -> list[SourcePost]:
+        request_headers = self._rss_validators.get(feed_url, {})
+        try:
+            async with semaphore:
+                response = await client.get(feed_url, headers=request_headers)
+            if response.status_code == 304:
+                return []
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            activity(
+                "podcast_rss_fetch_failed",
+                source="Podcast / RSS",
+                feed_url=feed_url,
+                error_type=type(exc).__name__,
+                level="WARNING",
+            )
             return []
+
+        validators: dict[str, str] = {}
+        if response.headers.get("etag"):
+            validators["If-None-Match"] = response.headers["etag"]
+        if response.headers.get("last-modified"):
+            validators["If-Modified-Since"] = response.headers["last-modified"]
+        if validators:
+            self._rss_validators[feed_url] = validators
+        else:
+            self._rss_validators.pop(feed_url, None)
+
+        bootstrapped = feed_url in self._rss_bootstrapped_feeds
         posts: list[SourcePost] = []
+        for identity, post in parse_rss_entries(response.text, feed_url):
+            content_hash = hashlib.sha1(post.text.encode("utf-8")).hexdigest()
+            seen_key = f"{feed_url}|{identity}|{content_hash}"
+            if seen_key in self._seen_rss_entries:
+                continue
+            self._seen_rss_entries.add(seen_key)
+
+            # Do not dump old feed history into Telegram on startup. Keep a small
+            # lookback for genuinely recent episodes, then monitor only newly
+            # appearing or edited RSS entries after the feed is bootstrapped.
+            if post.created_at is not None and post.created_at < cutoff:
+                continue
+            if post.created_at is None and not bootstrapped:
+                continue
+            if extract_referral_links(post.text):
+                posts.append(post)
+        self._rss_bootstrapped_feeds.add(feed_url)
+        return posts
+
+    async def _fetch_rss(self) -> list[SourcePost]:
+        feed_urls = self._rss_feed_urls()
+        self._last_rss_polled = len(feed_urls)
+        if not feed_urls:
+            return []
         headers = {
             "User-Agent": self.user_agent,
             "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,*/*",
         }
         timeout = httpx.Timeout(15.0, connect=8.0)
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.lookback_minutes)
+        semaphore = asyncio.Semaphore(min(8, len(feed_urls)))
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers=headers,
         ) as client:
-            for feed_url in list(self._feeds)[: self.rss_max_feeds]:
-                bootstrapped = feed_url in self._rss_bootstrapped_feeds
-                try:
-                    response = await client.get(feed_url)
-                    response.raise_for_status()
-                except httpx.HTTPError:
-                    continue
-                for identity, post in parse_rss_entries(response.text, feed_url):
-                    identity = f"{feed_url}|{identity}"
-                    if identity in self._seen_rss_entries:
-                        continue
-                    self._seen_rss_entries.add(identity)
-
-                    # Do not dump old feed history into Telegram on startup. Keep a
-                    # small lookback for genuinely recent episodes, then monitor only
-                    # newly appearing RSS entries after the feed is bootstrapped.
-                    if post.created_at is not None and post.created_at < cutoff:
-                        continue
-                    if post.created_at is None and not bootstrapped:
-                        continue
-                    if extract_referral_links(post.text):
-                        posts.append(post)
-                self._rss_bootstrapped_feeds.add(feed_url)
-        return posts
+            batches = await asyncio.gather(
+                *(
+                    self._fetch_rss_feed(client, feed_url, cutoff, semaphore)
+                    for feed_url in feed_urls
+                )
+            )
+        return [post for batch in batches for post in batch]
 
     async def fetch(self) -> list[SourcePost]:
         if not self.api_key or not self.api_secret:
@@ -503,6 +724,7 @@ class PodcastWatcher(BaseWatcher):
         activity("source_poll_started", source="Podcast / RSS")
         now = time.monotonic()
         posts: list[SourcePost] = []
+        self._last_rss_polled = 0
         timeout = httpx.Timeout(30.0, connect=10.0)
         async with httpx.AsyncClient(timeout=timeout) as client:
             if now - self._last_discovery_at >= self.discovery_interval_seconds:
@@ -532,6 +754,11 @@ class PodcastWatcher(BaseWatcher):
             source="Podcast / RSS",
             posts_found=len(unique),
             rss_feeds=len(self._feeds),
+            rss_feeds_polled=self._last_rss_polled,
+            recent_episodes_scanned=self._last_index_scanned,
+            relevant_candidates=self._last_index_relevant,
+            recent_feeds_promoted=self._last_recent_feeds_promoted,
+            transcripts_checked=self._last_transcripts_checked,
         )
         return unique
 

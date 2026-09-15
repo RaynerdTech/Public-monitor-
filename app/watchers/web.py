@@ -7,10 +7,12 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.core.activity_log import activity
+from app.core.extractor import extract_referral_links
 from app.watchers.base import BaseWatcher, SourcePost
 
 
 EXA_SEARCH_URL = "https://api.exa.ai/search"
+EXA_CONTENTS_URL = "https://api.exa.ai/contents"
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -41,6 +43,28 @@ def _plain_text_from_html(value: str) -> str:
     return html.unescape(_TAG_RE.sub(" ", value))
 
 
+def _exa_links(result: dict) -> list[str]:
+    """Return links Exa extracted from the result page."""
+    extras = result.get("extras")
+    if not isinstance(extras, dict):
+        return []
+    rows = extras.get("links")
+    if not isinstance(rows, list):
+        return []
+
+    links: list[str] = []
+    for row in rows:
+        if isinstance(row, str):
+            url = row.strip()
+        elif isinstance(row, dict):
+            url = str(row.get("url") or row.get("href") or "").strip()
+        else:
+            url = ""
+        if url:
+            links.append(url)
+    return links
+
+
 def exa_result_to_source_post(result: dict, page_text: str = "") -> SourcePost | None:
     url = str(result.get("url") or "").strip()
     if not url:
@@ -53,6 +77,7 @@ def exa_result_to_source_post(result: dict, page_text: str = "") -> SourcePost |
     highlights = result.get("highlights") or []
     if not isinstance(highlights, list):
         highlights = []
+    extracted_links = _exa_links(result)
 
     pieces = [
         title,
@@ -61,6 +86,7 @@ def exa_result_to_source_post(result: dict, page_text: str = "") -> SourcePost |
         summary,
         raw_text,
         *[str(item) for item in highlights if item],
+        *extracted_links,
         page_text,
         _plain_text_from_html(page_text),
     ]
@@ -101,7 +127,9 @@ class ExaWebWatcher(BaseWatcher):
         self.lookback_minutes = max(5, lookback_minutes)
         self.search_type = search_type.strip() or "fast"
         self.page_fetch_timeout_seconds = max(3, page_fetch_timeout_seconds)
-        self._seen_urls: set[str] = set()
+        # Remember the referral set, rather than the page URL alone, so an edited
+        # page can still produce a newly added code on a later poll.
+        self._seen_referrals_by_url: dict[str, frozenset[str]] = {}
         self._status = status_callback or (lambda _message: None)
 
     async def _search(
@@ -139,6 +167,47 @@ class ExaWebWatcher(BaseWatcher):
             raise last_error
         rows = body.get("results", []) if isinstance(body, dict) else []
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    async def _fetch_exa_contents(
+        self,
+        client: httpx.AsyncClient,
+        urls: list[str],
+    ) -> list[dict]:
+        """Use Exa's crawler only for pages the normal page fetch could not read."""
+        if not urls:
+            return []
+        payload = {
+            "ids": urls,
+            "highlights": {
+                "query": "Claude referral URL claude.ai/referral guest pass",
+                "maxCharacters": 3000,
+            },
+            "extras": {"links": 50},
+            "livecrawl": "preferred",
+            "livecrawlTimeout": min(10_000, self.page_fetch_timeout_seconds * 1000),
+            "maxAgeHours": 1,
+        }
+        last_error: httpx.HTTPError | None = None
+        for attempt in range(3):
+            try:
+                response = await client.post(EXA_CONTENTS_URL, json=payload)
+                response.raise_for_status()
+                body = response.json()
+                rows = body.get("results", []) if isinstance(body, dict) else []
+                return (
+                    [row for row in rows if isinstance(row, dict)]
+                    if isinstance(rows, list)
+                    else []
+                )
+            except httpx.HTTPStatusError:
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                last_error = exc
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1 << attempt)
+        assert last_error is not None
+        raise last_error
 
     async def _fetch_page(self, client: httpx.AsyncClient, url: str) -> str | None:
         """Fetch a candidate page.
@@ -192,7 +261,7 @@ class ExaWebWatcher(BaseWatcher):
                 rows = await self._search(exa_client, query, cutoff)
                 for row in rows:
                     url = str(row.get("url") or "").strip()
-                    if not url or url in self._seen_urls or url in candidate_urls:
+                    if not url or url in candidate_urls:
                         continue
 
                     published_at = parse_exa_timestamp(row.get("publishedDate"))
@@ -218,21 +287,92 @@ class ExaWebWatcher(BaseWatcher):
         }
         timeout = httpx.Timeout(self.page_fetch_timeout_seconds)
         posts: list[SourcePost] = []
+        search_metadata_hits = 0
+        page_fetches = 0
+        fallback_candidates: list[dict] = []
+
+        def append_if_new(row: dict, page_text: str = "") -> bool:
+            post = exa_result_to_source_post(row, page_text)
+            if post is None:
+                return False
+            url = str(row.get("url") or "").strip()
+            referral_links = frozenset(extract_referral_links(post.text))
+            if not referral_links:
+                return False
+            if self._seen_referrals_by_url.get(url) == referral_links:
+                return False
+            self._seen_referrals_by_url[url] = referral_links
+            posts.append(post)
+            return True
+
         async with httpx.AsyncClient(
             timeout=timeout,
             follow_redirects=True,
             headers=page_headers,
         ) as page_client:
-            for row in candidates:
+            semaphore = asyncio.Semaphore(min(5, max(1, len(candidates))))
+
+            async def inspect(row: dict) -> tuple[dict, str | None, bool]:
                 url = str(row.get("url") or "").strip()
-                page_text = await self._fetch_page(page_client, url)
-                self._seen_urls.add(url)
+                metadata_post = exa_result_to_source_post(row)
+                metadata_has_referral = bool(
+                    metadata_post and extract_referral_links(metadata_post.text)
+                )
+                if metadata_has_referral:
+                    return row, "", True
+                async with semaphore:
+                    return row, await self._fetch_page(page_client, url), False
+
+            inspected = await asyncio.gather(*(inspect(row) for row in candidates))
+            page_fetches = sum(1 for _row, _text, metadata_hit in inspected if not metadata_hit)
+            for row, page_text, metadata_hit in inspected:
+                url = str(row.get("url") or "").strip()
+                if metadata_hit:
+                    search_metadata_hits += 1
+                    append_if_new(row)
+                    continue
                 if page_text is None:
                     self._status(f"Skipping dead web result (404/410): {url}")
                     continue
-                post = exa_result_to_source_post(row, page_text)
-                if post is not None:
-                    posts.append(post)
+                if page_text:
+                    append_if_new(row, page_text)
+                else:
+                    fallback_candidates.append(row)
+
+        exa_fallback_pages = 0
+        if fallback_candidates:
+            fallback_urls = [str(row.get("url") or "") for row in fallback_candidates]
+            originals = {str(row.get("url") or ""): row for row in fallback_candidates}
+            try:
+                async with httpx.AsyncClient(
+                    timeout=exa_timeout, headers=headers
+                ) as exa_client:
+                    enriched_rows = await self._fetch_exa_contents(
+                        exa_client, fallback_urls
+                    )
+            except httpx.HTTPError as exc:
+                enriched_rows = []
+                activity(
+                    "exa_content_fallback_failed",
+                    source="Web / Exa",
+                    pages=len(fallback_urls),
+                    error_type=type(exc).__name__,
+                    level="WARNING",
+                )
+
+            for index, enriched in enumerate(enriched_rows):
+                result_url = str(
+                    enriched.get("url") or enriched.get("id") or ""
+                ).strip()
+                original = originals.get(result_url)
+                if original is None and index < len(fallback_candidates):
+                    original = fallback_candidates[index]
+                if original is None:
+                    continue
+                original_url = str(original.get("url") or "").strip()
+                combined = {**original, **enriched, "url": original_url}
+                if append_if_new(combined):
+                    exa_fallback_pages += 1
 
         posts.sort(key=lambda post: post.created_at or now)
         activity(
@@ -240,6 +380,10 @@ class ExaWebWatcher(BaseWatcher):
             source="Web / Exa",
             candidates=len(candidates),
             posts_found=len(posts),
+            search_metadata_hits=search_metadata_hits,
+            page_fetches=page_fetches,
+            exa_fallback_requested=len(fallback_candidates),
+            exa_fallback_matches=exa_fallback_pages,
         )
         return posts
 

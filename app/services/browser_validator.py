@@ -139,7 +139,6 @@ async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
             ),
         )
 
-    referral_url = f"https://claude.ai/referral/{code}"
     api_url = f"https://claude.ai/api/referral/code/{code}"
 
     async with _BROWSER_LOCK:
@@ -153,7 +152,10 @@ async def fetch_referral_api_in_browser(code: str) -> BrowserFetchResult:
                     )
                     try:
                         await page.goto(
-                            referral_url,
+                            # Go directly to the JSON endpoint. The public
+                            # referral page has a separate Cloudflare challenge
+                            # and is not needed to validate the code.
+                            api_url,
                             wait_until="domcontentloaded",
                             timeout=int(VALIDATOR_BROWSER_NAVIGATION_TIMEOUT_SECONDS * 1000),
                         )
