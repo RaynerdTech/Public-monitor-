@@ -69,7 +69,7 @@ async def get_telegram_updates(
     url = f"https://api.telegram.org/bot{bot_token}/getUpdates"
     params: dict[str, int | str] = {
         "timeout": max(0, timeout),
-        "allowed_updates": '["callback_query"]',
+        "allowed_updates": '["callback_query","message"]',
     }
     if offset is not None:
         params["offset"] = offset
@@ -81,6 +81,21 @@ async def get_telegram_updates(
     if not data.get("ok"):
         raise RuntimeError("Telegram returned an unsuccessful response")
     return data.get("result", [])
+
+
+async def delete_telegram_message(
+    bot_token: str,
+    chat_id: str,
+    message_id: int,
+) -> None:
+    """Best-effort helper used to remove sensitive admin commands from chat history."""
+    url = f"https://api.telegram.org/bot{bot_token}/deleteMessage"
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            url,
+            json={"chat_id": chat_id, "message_id": message_id},
+        )
+        response.raise_for_status()
 
 
 async def answer_telegram_callback(
@@ -165,6 +180,11 @@ def _friendly_source(source: str) -> str:
         "x-repost:": "X repost by ",
         "x:": "X post by ",
         "threads:": "Threads post by ",
+        "instagram:search:@": "Instagram post by ",
+        "instagram:search:": "Instagram post: ",
+        "facebook:search:": "Facebook post by ",
+        "facebook:search": "Facebook post",
+        "reddit:": "Reddit post: ",
         "youtube:": "YouTube video from ",
         "podcast-rss:": "Podcast episode from ",
         "podcast:": "Podcast episode from ",

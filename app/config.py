@@ -14,6 +14,28 @@ def _env_bool(name: str, default: bool) -> bool:
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
+SCRAPE_CREATORS_API_KEY = os.getenv("SCRAPE_CREATORS_API_KEY", "").strip()
+SCRAPE_CREATORS_TIMEOUT_SECONDS = max(3.0, float(os.getenv("SCRAPE_CREATORS_TIMEOUT_SECONDS", "30")))
+
+# Apify powers broad public Facebook and Instagram discovery. The token can be
+# rotated live from Telegram and persisted to Render when Render API access is configured.
+APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "").strip()
+APIFY_TIMEOUT_SECONDS = max(30.0, float(os.getenv("APIFY_TIMEOUT_SECONDS", "150")))
+APIFY_MAX_RUN_COST_USD = max(0.01, float(os.getenv("APIFY_MAX_RUN_COST_USD", "0.10")))
+APIFY_FACEBOOK_ACTOR_ID = (
+    os.getenv("APIFY_FACEBOOK_ACTOR_ID", "memo23~facebook-search-scraper").strip()
+    or "memo23~facebook-search-scraper"
+)
+APIFY_INSTAGRAM_ACTOR_ID = (
+    os.getenv(
+        "APIFY_INSTAGRAM_ACTOR_ID",
+        "scraping_solutions~instagram-boolean-search-scraper-posts-reels",
+    ).strip()
+    or "scraping_solutions~instagram-boolean-search-scraper-posts-reels"
+)
+APIFY_RENDER_AUTO_DEPLOY = _env_bool("APIFY_RENDER_AUTO_DEPLOY", True)
+
+
 def _telegram_chat_ids() -> list[str]:
     # TELEGRAM_CHAT_IDS is the canonical setting. Keep TELEGRAM_CHAT_ID as a
     # backwards-compatible fallback, including comma-separated values.
@@ -23,6 +45,14 @@ def _telegram_chat_ids() -> list[str]:
 
 TELEGRAM_CHAT_IDS = _telegram_chat_ids()
 TELEGRAM_CHAT_ID = TELEGRAM_CHAT_IDS[0] if TELEGRAM_CHAT_IDS else ""
+
+
+def _telegram_admin_chat_ids() -> list[str]:
+    raw = os.getenv("TELEGRAM_ADMIN_CHAT_IDS", "")
+    return [chat_id.strip() for chat_id in raw.split(",") if chat_id.strip()]
+
+
+TELEGRAM_ADMIN_CHAT_IDS = _telegram_admin_chat_ids()
 DATABASE_PATH = os.getenv("DATABASE_PATH", "referrals.db").strip() or "referrals.db"
 VALIDATION_TIMEOUT_SECONDS = float(os.getenv("VALIDATION_TIMEOUT_SECONDS", "10"))
 VALIDATION_RETRIES = max(1, int(os.getenv("VALIDATION_RETRIES", "2")))
@@ -85,6 +115,10 @@ THREADS_RENDER_ENV_KEY = (
 THREADS_RENDER_AUTO_DEPLOY = _env_bool("THREADS_RENDER_AUTO_DEPLOY", True)
 THREADS_RENDER_API_KEY = os.getenv("THREADS_RENDER_API_KEY", "").strip()
 THREADS_RENDER_SERVICE_ID = os.getenv("THREADS_RENDER_SERVICE_ID", "").strip()
+# Generic Render credentials are used for runtime secret rotation. Fall back to
+# the older Threads-specific names so existing deployments stay compatible.
+RENDER_API_KEY = os.getenv("RENDER_API_KEY", "").strip() or THREADS_RENDER_API_KEY
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID", "").strip() or THREADS_RENDER_SERVICE_ID
 THREADS_OAUTH_HOST = os.getenv("THREADS_OAUTH_HOST", "127.0.0.1").strip() or "127.0.0.1"
 THREADS_OAUTH_PORT = max(1, min(65535, int(os.getenv("THREADS_OAUTH_PORT", "8765"))))
 THREADS_REDIRECT_URI = os.getenv("THREADS_REDIRECT_URI", "").strip()
@@ -98,15 +132,16 @@ THREADS_OAUTH_SCOPES = [
     if scope.strip()
 ]
 THREADS_WATCH_INTERVAL_SECONDS = max(
-    10, int(os.getenv("THREADS_WATCH_INTERVAL_SECONDS", "30"))
+    30, int(os.getenv("THREADS_WATCH_INTERVAL_SECONDS", "300"))
 )
+THREADS_LOOKBACK_MINUTES = max(1, int(os.getenv("THREADS_LOOKBACK_MINUTES", "7")))
 THREADS_SEARCH_LIMIT = min(100, max(1, int(os.getenv("THREADS_SEARCH_LIMIT", "50"))))
 THREADS_QUERIES = [
     query.strip()
     for query in os.getenv(
         "THREADS_QUERIES",
-        "claude.ai/referral,claude referral",
-    ).split(",")
+        "claude referral",
+    ).split("||")
     if query.strip()
 ]
 
@@ -117,17 +152,47 @@ REDDIT_USER_AGENT = os.getenv(
     "windows:referral-monitor:v0.6",
 ).strip()
 REDDIT_WATCH_INTERVAL_SECONDS = max(
-    10, int(os.getenv("REDDIT_WATCH_INTERVAL_SECONDS", "20"))
+    30, int(os.getenv("REDDIT_WATCH_INTERVAL_SECONDS", "300"))
 )
+REDDIT_LOOKBACK_MINUTES = max(1, int(os.getenv("REDDIT_LOOKBACK_MINUTES", "7")))
 REDDIT_SEARCH_LIMIT = min(100, max(1, int(os.getenv("REDDIT_SEARCH_LIMIT", "100"))))
 REDDIT_QUERIES = [
     query.strip()
     for query in os.getenv(
         "REDDIT_QUERIES",
-        'claude.ai/referral||"Claude referral"||"Claude guest pass"',
+        "claude referral",
     ).split("||")
     if query.strip()
 ]
+
+REDDIT_SCRAPE_FILTER = os.getenv("REDDIT_SCRAPE_FILTER", "posts").strip().lower() or "posts"
+REDDIT_SCRAPE_TIMEFRAME = os.getenv("REDDIT_SCRAPE_TIMEFRAME", "day").strip().lower() or "day"
+
+INSTAGRAM_WATCH_INTERVAL_SECONDS = max(
+    60, int(os.getenv("INSTAGRAM_WATCH_INTERVAL_SECONDS", "900"))
+)
+INSTAGRAM_LOOKBACK_MINUTES = max(1, int(os.getenv("INSTAGRAM_LOOKBACK_MINUTES", "17")))
+INSTAGRAM_QUERIES = [
+    value.strip()
+    for value in os.getenv("INSTAGRAM_QUERIES", "claude referral").split("||")
+    if value.strip()
+]
+INSTAGRAM_SEARCH_LIMIT = min(100, max(1, int(os.getenv("INSTAGRAM_SEARCH_LIMIT", "10"))))
+INSTAGRAM_CONTENT_TYPE = os.getenv("INSTAGRAM_CONTENT_TYPE", "posts_and_reels").strip() or "posts_and_reels"
+INSTAGRAM_SEARCH_COVERAGE = os.getenv("INSTAGRAM_SEARCH_COVERAGE", "efficient").strip() or "efficient"
+INSTAGRAM_HASHTAG_FEED_TYPE = os.getenv("INSTAGRAM_HASHTAG_FEED_TYPE", "recent").strip() or "recent"
+
+FACEBOOK_WATCH_INTERVAL_SECONDS = max(
+    60, int(os.getenv("FACEBOOK_WATCH_INTERVAL_SECONDS", "600"))
+)
+FACEBOOK_LOOKBACK_MINUTES = max(1, int(os.getenv("FACEBOOK_LOOKBACK_MINUTES", "12")))
+FACEBOOK_QUERIES = [
+    value.strip()
+    for value in os.getenv("FACEBOOK_QUERIES", "claude referral").split("||")
+    if value.strip()
+]
+FACEBOOK_SEARCH_LIMIT = min(100, max(1, int(os.getenv("FACEBOOK_SEARCH_LIMIT", "10"))))
+FACEBOOK_PAGE_DELAY_MS = max(0, int(os.getenv("FACEBOOK_PAGE_DELAY_MS", "800")))
 
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 YOUTUBE_WATCH_INTERVAL_SECONDS = max(

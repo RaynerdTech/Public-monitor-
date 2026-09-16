@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from app.config import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_IDS,
+    TELEGRAM_ADMIN_CHAT_IDS,
     TELEGRAM_FEEDBACK_POLL_SECONDS,
     TELEGRAM_RETRY_BASE_SECONDS,
     TELEGRAM_RETRY_MAX_SECONDS,
@@ -28,6 +29,7 @@ from app.core.database import (
     record_validation_attempt,
 )
 from app.core.models import ReferralCandidate
+from app.services.telegram_admin import handle_telegram_admin_message
 from app.services.telegram import (
     answer_telegram_callback,
     edit_telegram_message,
@@ -340,7 +342,7 @@ async def _handle_telegram_feedback(callback: dict) -> None:
 
 async def run_telegram_feedback_loop() -> None:
     """Process the Worked/Invalid buttons shown under referral alerts."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+    if not TELEGRAM_BOT_TOKEN or not (TELEGRAM_CHAT_IDS or TELEGRAM_ADMIN_CHAT_IDS):
         activity("telegram_feedback_disabled", reason="telegram_not_configured")
         return
 
@@ -360,6 +362,9 @@ async def run_telegram_feedback_loop() -> None:
                 callback = update.get("callback_query")
                 if isinstance(callback, dict):
                     await _handle_telegram_feedback(callback)
+                message = update.get("message")
+                if isinstance(message, dict):
+                    await handle_telegram_admin_message(message)
             if not updates:
                 await asyncio.sleep(TELEGRAM_FEEDBACK_POLL_SECONDS)
         except asyncio.CancelledError:

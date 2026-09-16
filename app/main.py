@@ -39,12 +39,17 @@ from app.config import (
     PODCAST_TRANSCRIPT_RETRIES,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_IDS,
+    SCRAPE_CREATORS_API_KEY,
+    SCRAPE_CREATORS_TIMEOUT_SECONDS,
     REDDIT_CLIENT_ID,
     REDDIT_CLIENT_SECRET,
     REDDIT_QUERIES,
     REDDIT_SEARCH_LIMIT,
     REDDIT_USER_AGENT,
     REDDIT_WATCH_INTERVAL_SECONDS,
+    REDDIT_LOOKBACK_MINUTES,
+    REDDIT_SCRAPE_FILTER,
+    REDDIT_SCRAPE_TIMEFRAME,
     THREADS_ACCESS_TOKEN,
     THREADS_APP_ID,
     THREADS_APP_SECRET,
@@ -62,6 +67,28 @@ from app.config import (
     THREADS_QUERIES,
     THREADS_SEARCH_LIMIT,
     THREADS_WATCH_INTERVAL_SECONDS,
+    THREADS_LOOKBACK_MINUTES,
+    APIFY_API_TOKEN,
+    APIFY_TIMEOUT_SECONDS,
+    APIFY_MAX_RUN_COST_USD,
+    APIFY_FACEBOOK_ACTOR_ID,
+    APIFY_INSTAGRAM_ACTOR_ID,
+    APIFY_RENDER_AUTO_DEPLOY,
+    RENDER_API_KEY,
+    RENDER_SERVICE_ID,
+    TELEGRAM_ADMIN_CHAT_IDS,
+    INSTAGRAM_WATCH_INTERVAL_SECONDS,
+    INSTAGRAM_LOOKBACK_MINUTES,
+    INSTAGRAM_QUERIES,
+    INSTAGRAM_SEARCH_LIMIT,
+    INSTAGRAM_CONTENT_TYPE,
+    INSTAGRAM_SEARCH_COVERAGE,
+    INSTAGRAM_HASHTAG_FEED_TYPE,
+    FACEBOOK_WATCH_INTERVAL_SECONDS,
+    FACEBOOK_LOOKBACK_MINUTES,
+    FACEBOOK_QUERIES,
+    FACEBOOK_SEARCH_LIMIT,
+    FACEBOOK_PAGE_DELAY_MS,
     URL_WATCH_INTERVAL_SECONDS,
     VALIDATOR_BROWSER_FALLBACK_ENABLED,
     VALIDATOR_BROWSER_HEADLESS,
@@ -82,6 +109,7 @@ from app.core.database import get_recent_referrals, get_referral_by_code, init_d
 from app.core.activity_log import activity
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.services.pipeline import process_post
+from app.services.runtime_secrets import get_apify_token, masked_apify_token
 from app.services.retry_queue import run_retry_queues, run_telegram_feedback_loop
 from app.services.threads_oauth import (
     build_threads_authorization_url,
@@ -108,6 +136,10 @@ from app.services.validator import ValidationResult, validate_referral
 from app.watchers.base import SourcePost
 from app.watchers.file import FileWatcher
 from app.watchers.podcast import PodcastWatcher
+from app.watchers.scrape_reddit import ScrapeCreatorsRedditWatcher
+from app.watchers.scrape_threads import ScrapeCreatorsThreadsWatcher
+from app.watchers.apify_instagram import ApifyInstagramWatcher
+from app.watchers.apify_facebook import ApifyFacebookWatcher
 from app.watchers.reddit import RedditWatcher
 from app.watchers.sites import DirectWebsiteWatcher
 from app.watchers.threads import ThreadsWatcher
@@ -119,7 +151,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.3"
+APP_VERSION = "10.5.0"
 _threads_persistence_lock = threading.Lock()
 
 
@@ -215,7 +247,7 @@ def _threads_current_token(*, refresh_if_needed: bool = False) -> str:
 
 
 def _threads_configured() -> bool:
-    return bool(_threads_current_token() and THREADS_QUERIES)
+    return bool(SCRAPE_CREATORS_API_KEY and THREADS_QUERIES)
 
 
 def _threads_oauth_configured() -> bool:
@@ -223,7 +255,29 @@ def _threads_oauth_configured() -> bool:
 
 
 def _reddit_configured() -> bool:
-    return bool(REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT and REDDIT_QUERIES)
+    return bool(SCRAPE_CREATORS_API_KEY and REDDIT_QUERIES)
+
+
+def _instagram_configured() -> bool:
+    return bool(get_apify_token() and INSTAGRAM_QUERIES)
+
+
+def _facebook_configured() -> bool:
+    return bool(get_apify_token() and FACEBOOK_QUERIES)
+
+
+def _monthly_scrape_creator_requests(interval_seconds: int, request_count_per_poll: int) -> int:
+    if request_count_per_poll <= 0:
+        return 0
+    seconds_per_30_days = 30 * 24 * 60 * 60
+    return round((seconds_per_30_days / max(1, interval_seconds)) * request_count_per_poll)
+
+
+def _monthly_apify_runs(interval_seconds: int, query_count: int) -> int:
+    if query_count <= 0:
+        return 0
+    seconds_per_30_days = 30 * 24 * 60 * 60
+    return round((seconds_per_30_days / max(1, interval_seconds)) * query_count)
 
 
 def _youtube_configured() -> bool:
@@ -584,7 +638,7 @@ def threads_oauth_server(
 
 @cli.command("threads-web-server")
 def threads_web_server() -> None:
-    """Run a persistent public Threads OAuth web service for hosted deployments."""
+    """Run the hosted health service and optional legacy Threads OAuth callback."""
     oauth_configured = _threads_oauth_configured()
 
     try:
@@ -644,7 +698,7 @@ def threads_web_server() -> None:
                 self._send_html(
                     200,
                     f"Referral Monitor v{APP_VERSION}",
-                    "Threads OAuth service and production queues are running.",
+                    "Referral monitor health service and production queues are running.",
                 )
                 return
 
@@ -800,19 +854,20 @@ def threads_web_server() -> None:
         oauth_configured=oauth_configured,
         redirect_configured=bool(redirect_uri),
     )
-    console.print(f"[green]Threads web service listening on 0.0.0.0:{port}[/green]")
-    if not oauth_configured:
+    console.print(f"[green]Referral Monitor web service listening on 0.0.0.0:{port}[/green]")
+    if oauth_configured:
+        if redirect_uri:
+            console.print(f"Legacy Threads callback URL: [cyan]{redirect_uri}[/cyan]")
+            # Never print THREADS_OAUTH_START_KEY. Render logs are visible to anyone
+            # with service log access and should not contain authorization secrets.
+            console.print("Legacy authorization endpoint: [cyan]/threads/authorize[/cyan]")
+        else:
+            console.print(
+                "[yellow]Legacy Threads OAuth is configured but has no public callback URL.[/yellow]"
+            )
+    elif SCRAPE_CREATORS_API_KEY:
         console.print(
-            "[yellow]Threads App ID/secret not configured yet. The health endpoint is live, but authorization stays disabled until those variables are added.[/yellow]"
-        )
-    if redirect_uri:
-        console.print(f"Callback URL: [cyan]{redirect_uri}[/cyan]")
-        # Never print THREADS_OAUTH_START_KEY. Render logs are visible to anyone
-        # with service log access and should not contain authorization secrets.
-        console.print("Authorization endpoint: [cyan]/threads/authorize[/cyan]")
-    else:
-        console.print(
-            "[yellow]No public callback URL yet. Generate the hosting domain, then set THREADS_REDIRECT_URI and redeploy.[/yellow]"
+            "[green]Legacy Threads OAuth is disabled; Scrape Creators social monitoring does not require it.[/green]"
         )
 
     try:
@@ -848,24 +903,25 @@ def threads_token_status() -> None:
 def threads_test(
     query: str | None = typer.Option(
         None,
-        help="Override the configured Threads search query",
+        help="Override the configured Scrape Creators Threads search query",
     ),
 ) -> None:
     async def run() -> None:
-        token = _threads_current_token(refresh_if_needed=True)
-        if not token:
-            console.print(
-                "[red]Threads token is not configured. Run threads-oauth-server or set "
-                "THREADS_ACCESS_TOKEN.[/red]"
-            )
+        if not SCRAPE_CREATORS_API_KEY:
+            console.print("[red]Set SCRAPE_CREATORS_API_KEY in .env first.[/red]")
             raise typer.Exit(1)
 
         queries = [query] if query else THREADS_QUERIES
-        watcher = ThreadsWatcher(
-            token,
+        if not queries:
+            console.print("[red]Set THREADS_QUERIES in .env first.[/red]")
+            raise typer.Exit(1)
+
+        watcher = ScrapeCreatorsThreadsWatcher(
+            SCRAPE_CREATORS_API_KEY,
             queries,
             interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
-            limit=THREADS_SEARCH_LIMIT,
+            lookback_minutes=THREADS_LOOKBACK_MINUTES,
+            timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
 
         try:
@@ -873,11 +929,11 @@ def threads_test(
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:400]
             console.print(
-                f"[red]Threads API returned HTTP {exc.response.status_code}.[/red] {detail}"
+                f"[red]Scrape Creators Threads returned HTTP {exc.response.status_code}.[/red] {detail}"
             )
             raise typer.Exit(1)
-        except httpx.HTTPError as exc:
-            console.print(f"[red]Threads request failed:[/red] {exc}")
+        except (httpx.HTTPError, RuntimeError) as exc:
+            console.print(f"[red]Scrape Creators Threads request failed:[/red] {exc}")
             raise typer.Exit(1)
 
         table = Table("Source", "Posted", "URL", "Referral in text?")
@@ -889,7 +945,13 @@ def threads_test(
                 "yes" if extract_referral_links(post.text) else "no",
             )
         console.print(table)
-        console.print(f"[green]Threads API working. {len(posts)} recent posts returned.[/green]")
+        console.print(
+            f"[green]Scrape Creators Threads working. {len(posts)} result(s) returned.[/green]"
+        )
+        if watcher.client.last_credits_remaining is not None:
+            console.print(
+                f"Credits remaining: [cyan]{watcher.client.last_credits_remaining}[/cyan]"
+            )
 
     asyncio.run(run())
 
@@ -898,35 +960,31 @@ def threads_test(
 def watch_threads(
     interval: int = typer.Option(
         THREADS_WATCH_INTERVAL_SECONDS,
-        min=10,
+        min=30,
         help="Polling interval in seconds",
     ),
 ) -> None:
     if not _threads_configured():
         console.print(
-            "[red]Threads is not configured. Set THREADS_ACCESS_TOKEN and "
+            "[red]Threads is not configured. Set SCRAPE_CREATORS_API_KEY and "
             "THREADS_QUERIES in .env.[/red]"
         )
         raise typer.Exit(1)
 
     async def run() -> None:
-        token = _threads_current_token(refresh_if_needed=True)
-        if not token:
-            console.print("[red]Threads token is unavailable or expired.[/red]")
-            raise typer.Exit(1)
-
-        watcher = ThreadsWatcher(
-            token,
+        watcher = ScrapeCreatorsThreadsWatcher(
+            SCRAPE_CREATORS_API_KEY,
             THREADS_QUERIES,
             interval_seconds=interval,
-            limit=THREADS_SEARCH_LIMIT,
+            lookback_minutes=THREADS_LOOKBACK_MINUTES,
+            timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
         console.print(
-            "[green]Threads watcher started.[/green] "
-            f"Queries: {', '.join(THREADS_QUERIES)} | interval: {interval}s"
+            "[green]Threads watcher started through Scrape Creators.[/green] "
+            f"Queries: {' | '.join(THREADS_QUERIES)} | interval: {interval}s"
         )
         console.print(
-            "Valid new referrals will be stored and sent to Telegram when configured."
+            "New matches are passed through the existing dedupe, storage, Telegram and validation pipeline."
         )
 
         async for post in watcher.stream():
@@ -943,25 +1001,27 @@ def watch_threads(
 def reddit_test(
     query: str | None = typer.Option(
         None,
-        help="Override the configured Reddit search query",
+        help="Override the configured Scrape Creators Reddit search query",
     ),
 ) -> None:
     async def run() -> None:
-        if not _reddit_configured():
-            console.print(
-                "[red]Reddit is not configured. Set REDDIT_CLIENT_ID, "
-                "REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT in .env.[/red]"
-            )
+        if not SCRAPE_CREATORS_API_KEY:
+            console.print("[red]Set SCRAPE_CREATORS_API_KEY in .env first.[/red]")
             raise typer.Exit(1)
 
         queries = [query] if query else REDDIT_QUERIES
-        watcher = RedditWatcher(
-            REDDIT_CLIENT_ID,
-            REDDIT_CLIENT_SECRET,
-            REDDIT_USER_AGENT,
+        if not queries:
+            console.print("[red]Set REDDIT_QUERIES in .env first.[/red]")
+            raise typer.Exit(1)
+
+        watcher = ScrapeCreatorsRedditWatcher(
+            SCRAPE_CREATORS_API_KEY,
             queries,
             interval_seconds=REDDIT_WATCH_INTERVAL_SECONDS,
-            limit=REDDIT_SEARCH_LIMIT,
+            search_filter=REDDIT_SCRAPE_FILTER,
+            timeframe=REDDIT_SCRAPE_TIMEFRAME,
+            lookback_minutes=REDDIT_LOOKBACK_MINUTES,
+            timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
 
         try:
@@ -969,16 +1029,11 @@ def reddit_test(
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500]
             console.print(
-                f"[red]Reddit API returned HTTP {exc.response.status_code}.[/red] {detail}"
+                f"[red]Scrape Creators Reddit returned HTTP {exc.response.status_code}.[/red] {detail}"
             )
-            if exc.response.status_code in {401, 403}:
-                console.print(
-                    "[yellow]Check the OAuth client values and confirm Reddit approved "
-                    "this Data API use case.[/yellow]"
-                )
             raise typer.Exit(1)
-        except httpx.HTTPError as exc:
-            console.print(f"[red]Reddit request failed:[/red] {exc}")
+        except (httpx.HTTPError, RuntimeError) as exc:
+            console.print(f"[red]Scrape Creators Reddit request failed:[/red] {exc}")
             raise typer.Exit(1)
 
         table = Table("Source", "Posted", "URL", "Referral in text?")
@@ -991,8 +1046,12 @@ def reddit_test(
             )
         console.print(table)
         console.print(
-            f"[green]Reddit API working. {len(posts)} recent matching posts returned.[/green]"
+            f"[green]Scrape Creators Reddit working. {len(posts)} result(s) returned.[/green]"
         )
+        if watcher.client.last_credits_remaining is not None:
+            console.print(
+                f"Credits remaining: [cyan]{watcher.client.last_credits_remaining}[/cyan]"
+            )
 
     asyncio.run(run())
 
@@ -1001,40 +1060,33 @@ def reddit_test(
 def watch_reddit(
     interval: int = typer.Option(
         REDDIT_WATCH_INTERVAL_SECONDS,
-        min=10,
+        min=30,
         help="Polling interval in seconds",
     ),
 ) -> None:
     if not _reddit_configured():
         console.print(
-            "[red]Reddit is not configured. Set REDDIT_CLIENT_ID, "
-            "REDDIT_CLIENT_SECRET and REDDIT_USER_AGENT in .env.[/red]"
+            "[red]Reddit is not configured. Set SCRAPE_CREATORS_API_KEY and "
+            "REDDIT_QUERIES in .env.[/red]"
         )
         raise typer.Exit(1)
 
     async def run() -> None:
-        watcher = RedditWatcher(
-            REDDIT_CLIENT_ID,
-            REDDIT_CLIENT_SECRET,
-            REDDIT_USER_AGENT,
+        watcher = ScrapeCreatorsRedditWatcher(
+            SCRAPE_CREATORS_API_KEY,
             REDDIT_QUERIES,
             interval_seconds=interval,
-            limit=REDDIT_SEARCH_LIMIT,
+            search_filter=REDDIT_SCRAPE_FILTER,
+            timeframe=REDDIT_SCRAPE_TIMEFRAME,
+            lookback_minutes=REDDIT_LOOKBACK_MINUTES,
+            timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
         console.print(
-            "[green]Reddit watcher started.[/green] "
+            "[green]Reddit watcher started through Scrape Creators.[/green] "
             f"Queries: {' | '.join(REDDIT_QUERIES)} | interval: {interval}s"
-        )
-        console.print(
-            "New matching Reddit posts are passed through the same validator, "
-            "dedupe and Telegram pipeline as X."
         )
 
         async for post in watcher.stream():
-            console.print(
-                f"[cyan]Reddit match:[/cyan] {post.source} "
-                f"{post.created_at.isoformat() if post.created_at else ''}"
-            )
             results = await process_post(post)
             _print_results(results)
 
@@ -1042,12 +1094,192 @@ def watch_reddit(
         asyncio.run(run())
     except KeyboardInterrupt:
         console.print("\n[yellow]Reddit watcher stopped.[/yellow]")
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:500]
+
+
+@cli.command("instagram-test")
+def instagram_test(
+    query: str | None = typer.Option(None, help="Override the configured Apify Instagram query"),
+) -> None:
+    async def run() -> None:
+        if not get_apify_token():
+            console.print("[red]Set APIFY_API_TOKEN in .env first.[/red]")
+            raise typer.Exit(1)
+        queries = [query] if query else INSTAGRAM_QUERIES
+        if not queries:
+            console.print("[red]Set INSTAGRAM_QUERIES in .env first.[/red]")
+            raise typer.Exit(1)
+
+        watcher = ApifyInstagramWatcher(
+            queries,
+            actor_id=APIFY_INSTAGRAM_ACTOR_ID,
+            interval_seconds=INSTAGRAM_WATCH_INTERVAL_SECONDS,
+            lookback_minutes=INSTAGRAM_LOOKBACK_MINUTES,
+            max_results=INSTAGRAM_SEARCH_LIMIT,
+            content_type=INSTAGRAM_CONTENT_TYPE,
+            search_coverage=INSTAGRAM_SEARCH_COVERAGE,
+            hashtag_feed_type=INSTAGRAM_HASHTAG_FEED_TYPE,
+            timeout_seconds=APIFY_TIMEOUT_SECONDS,
+            max_run_cost_usd=APIFY_MAX_RUN_COST_USD,
+        )
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            console.print(
+                f"[red]Apify Instagram returned HTTP {exc.response.status_code}.[/red] "
+                f"{exc.response.text[:500]}"
+            )
+            raise typer.Exit(1)
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            console.print(f"[red]Apify Instagram request failed:[/red] {exc}")
+            raise typer.Exit(1)
+
+        table = Table("Source", "Posted", "URL", "Referral in text?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
         console.print(
-            f"[red]Reddit watcher stopped with HTTP {exc.response.status_code}.[/red] {detail}"
+            f"[green]Apify Instagram working. {len(posts)} recent result(s) returned.[/green]"
+        )
+        console.print(f"Actor runs used: [cyan]{watcher.client.total_runs}[/cyan]")
+
+    asyncio.run(run())
+
+
+@cli.command("watch-instagram")
+def watch_instagram(
+    interval: int = typer.Option(
+        INSTAGRAM_WATCH_INTERVAL_SECONDS,
+        min=60,
+        help="Polling interval in seconds",
+    ),
+) -> None:
+    if not _instagram_configured():
+        console.print(
+            "[red]Instagram is not configured. Set APIFY_API_TOKEN and INSTAGRAM_QUERIES.[/red]"
         )
         raise typer.Exit(1)
+
+    async def run() -> None:
+        watcher = ApifyInstagramWatcher(
+            INSTAGRAM_QUERIES,
+            actor_id=APIFY_INSTAGRAM_ACTOR_ID,
+            interval_seconds=interval,
+            lookback_minutes=INSTAGRAM_LOOKBACK_MINUTES,
+            max_results=INSTAGRAM_SEARCH_LIMIT,
+            content_type=INSTAGRAM_CONTENT_TYPE,
+            search_coverage=INSTAGRAM_SEARCH_COVERAGE,
+            hashtag_feed_type=INSTAGRAM_HASHTAG_FEED_TYPE,
+            timeout_seconds=APIFY_TIMEOUT_SECONDS,
+            max_run_cost_usd=APIFY_MAX_RUN_COST_USD,
+        )
+        console.print(
+            "[green]Instagram watcher started through Apify.[/green] "
+            f"queries={len(INSTAGRAM_QUERIES)} | interval={interval}s"
+        )
+        async for post in watcher.stream():
+            results = await process_post(post)
+            _print_results(results)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Instagram watcher stopped.[/yellow]")
+
+
+@cli.command("facebook-test")
+def facebook_test(
+    query: str | None = typer.Option(None, help="Override the configured Apify Facebook query"),
+) -> None:
+    async def run() -> None:
+        if not get_apify_token():
+            console.print("[red]Set APIFY_API_TOKEN in .env first.[/red]")
+            raise typer.Exit(1)
+        queries = [query] if query else FACEBOOK_QUERIES
+        if not queries:
+            console.print("[red]Set FACEBOOK_QUERIES in .env first.[/red]")
+            raise typer.Exit(1)
+
+        watcher = ApifyFacebookWatcher(
+            queries,
+            actor_id=APIFY_FACEBOOK_ACTOR_ID,
+            interval_seconds=FACEBOOK_WATCH_INTERVAL_SECONDS,
+            lookback_minutes=FACEBOOK_LOOKBACK_MINUTES,
+            max_results=FACEBOOK_SEARCH_LIMIT,
+            page_delay_ms=FACEBOOK_PAGE_DELAY_MS,
+            timeout_seconds=APIFY_TIMEOUT_SECONDS,
+            max_run_cost_usd=APIFY_MAX_RUN_COST_USD,
+        )
+        try:
+            posts = await watcher.fetch()
+        except httpx.HTTPStatusError as exc:
+            console.print(
+                f"[red]Apify Facebook returned HTTP {exc.response.status_code}.[/red] "
+                f"{exc.response.text[:500]}"
+            )
+            raise typer.Exit(1)
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            console.print(f"[red]Apify Facebook request failed:[/red] {exc}")
+            raise typer.Exit(1)
+
+        table = Table("Source", "Posted", "URL", "Referral in text?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
+        console.print(
+            f"[green]Apify Facebook working. {len(posts)} recent result(s) returned.[/green]"
+        )
+        console.print(f"Actor runs used: [cyan]{watcher.client.total_runs}[/cyan]")
+
+    asyncio.run(run())
+
+
+@cli.command("watch-facebook")
+def watch_facebook(
+    interval: int = typer.Option(
+        FACEBOOK_WATCH_INTERVAL_SECONDS,
+        min=60,
+        help="Polling interval in seconds",
+    ),
+) -> None:
+    if not _facebook_configured():
+        console.print(
+            "[red]Facebook is not configured. Set APIFY_API_TOKEN and FACEBOOK_QUERIES.[/red]"
+        )
+        raise typer.Exit(1)
+
+    async def run() -> None:
+        watcher = ApifyFacebookWatcher(
+            FACEBOOK_QUERIES,
+            actor_id=APIFY_FACEBOOK_ACTOR_ID,
+            interval_seconds=interval,
+            lookback_minutes=FACEBOOK_LOOKBACK_MINUTES,
+            max_results=FACEBOOK_SEARCH_LIMIT,
+            page_delay_ms=FACEBOOK_PAGE_DELAY_MS,
+            timeout_seconds=APIFY_TIMEOUT_SECONDS,
+            max_run_cost_usd=APIFY_MAX_RUN_COST_USD,
+        )
+        console.print(
+            "[green]Facebook watcher started through Apify.[/green] "
+            f"queries={len(FACEBOOK_QUERIES)} | interval={interval}s"
+        )
+        async for post in watcher.stream():
+            results = await process_post(post)
+            _print_results(results)
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Facebook watcher stopped.[/yellow]")
 
 
 @cli.command("youtube-test")
@@ -1880,7 +2112,7 @@ async def _run_threads_hosted() -> None:
 
 @cli.command("watch-all")
 def watch_all() -> None:
-    """Run the hosted OAuth web server and every configured referral watcher together."""
+    """Run the health web server and every configured referral watcher together."""
     # Render exposes PORT to web services. Start the HTTP callback/health server
     # in the same process so one Render Web Service can host the entire monitor.
     if os.getenv("PORT"):
@@ -1890,11 +2122,11 @@ def watch_all() -> None:
             daemon=True,
         )
         web_thread.start()
-        console.print("[green]Hosted OAuth/health web server starting.[/green]")
+        console.print("[green]Hosted health web server starting.[/green]")
 
     async def run() -> None:
         tasks: list[asyncio.Task] = [asyncio.create_task(run_retry_queues())]
-        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+        if TELEGRAM_BOT_TOKEN and (TELEGRAM_CHAT_IDS or TELEGRAM_ADMIN_CHAT_IDS):
             tasks.append(asyncio.create_task(run_telegram_feedback_loop()))
         source_task_count = 0
         activity(
@@ -2043,35 +2275,103 @@ def watch_all() -> None:
             activity("watcher_skipped", source="Podcast / RSS", reason="not_configured", level="WARNING")
             console.print("[yellow]Podcast / RSS skipped: not configured.[/yellow]")
 
-        if _reddit_configured():
-            reddit_watcher = RedditWatcher(
-                REDDIT_CLIENT_ID,
-                REDDIT_CLIENT_SECRET,
-                REDDIT_USER_AGENT,
-                REDDIT_QUERIES,
-                interval_seconds=REDDIT_WATCH_INTERVAL_SECONDS,
-                limit=REDDIT_SEARCH_LIMIT,
+        if _threads_configured():
+            threads_watcher = ScrapeCreatorsThreadsWatcher(
+                SCRAPE_CREATORS_API_KEY,
+                THREADS_QUERIES,
+                interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
+                lookback_minutes=THREADS_LOOKBACK_MINUTES,
+                timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
             )
             tasks.append(
                 asyncio.create_task(
                     _run_configured_monitor_stream(
-                        "Reddit", reddit_watcher
+                        "Threads", threads_watcher, retry_seconds=60
+                    )
+                )
+            )
+            source_task_count += 1
+        else:
+            activity("watcher_skipped", source="Threads", reason="not_configured", level="WARNING")
+            console.print(
+                "[yellow]Threads skipped: SCRAPE_CREATORS_API_KEY or THREADS_QUERIES is missing.[/yellow]"
+            )
+
+        if _reddit_configured():
+            reddit_watcher = ScrapeCreatorsRedditWatcher(
+                SCRAPE_CREATORS_API_KEY,
+                REDDIT_QUERIES,
+                interval_seconds=REDDIT_WATCH_INTERVAL_SECONDS,
+                search_filter=REDDIT_SCRAPE_FILTER,
+                timeframe=REDDIT_SCRAPE_TIMEFRAME,
+                lookback_minutes=REDDIT_LOOKBACK_MINUTES,
+                timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Reddit", reddit_watcher, retry_seconds=60
                     )
                 )
             )
             source_task_count += 1
         else:
             activity("watcher_skipped", source="Reddit", reason="not_configured", level="WARNING")
-            console.print("[yellow]Reddit skipped: awaiting API access/configuration.[/yellow]")
+            console.print(
+                "[yellow]Reddit skipped: SCRAPE_CREATORS_API_KEY or REDDIT_QUERIES is missing.[/yellow]"
+            )
 
-        # Threads is special: the same hosted process receives OAuth and saves the
-        # token. This task waits until that happens, then starts automatically.
-        if _threads_oauth_configured() or _threads_configured():
-            tasks.append(asyncio.create_task(_run_threads_hosted()))
+        if _instagram_configured():
+            instagram_watcher = ApifyInstagramWatcher(
+                INSTAGRAM_QUERIES,
+                actor_id=APIFY_INSTAGRAM_ACTOR_ID,
+                interval_seconds=INSTAGRAM_WATCH_INTERVAL_SECONDS,
+                lookback_minutes=INSTAGRAM_LOOKBACK_MINUTES,
+                max_results=INSTAGRAM_SEARCH_LIMIT,
+                content_type=INSTAGRAM_CONTENT_TYPE,
+                search_coverage=INSTAGRAM_SEARCH_COVERAGE,
+                hashtag_feed_type=INSTAGRAM_HASHTAG_FEED_TYPE,
+                timeout_seconds=APIFY_TIMEOUT_SECONDS,
+                max_run_cost_usd=APIFY_MAX_RUN_COST_USD,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Instagram", instagram_watcher, retry_seconds=60
+                    )
+                )
+            )
             source_task_count += 1
         else:
-            activity("watcher_skipped", source="Threads", reason="oauth_not_configured", level="WARNING")
-            console.print("[yellow]Threads skipped: OAuth app is not configured.[/yellow]")
+            activity("watcher_skipped", source="Instagram", reason="not_configured")
+            console.print(
+                "[yellow]Instagram skipped: APIFY_API_TOKEN or INSTAGRAM_QUERIES is missing.[/yellow]"
+            )
+
+        if _facebook_configured():
+            facebook_watcher = ApifyFacebookWatcher(
+                FACEBOOK_QUERIES,
+                actor_id=APIFY_FACEBOOK_ACTOR_ID,
+                interval_seconds=FACEBOOK_WATCH_INTERVAL_SECONDS,
+                lookback_minutes=FACEBOOK_LOOKBACK_MINUTES,
+                max_results=FACEBOOK_SEARCH_LIMIT,
+                page_delay_ms=FACEBOOK_PAGE_DELAY_MS,
+                timeout_seconds=APIFY_TIMEOUT_SECONDS,
+                max_run_cost_usd=APIFY_MAX_RUN_COST_USD,
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Facebook", facebook_watcher, retry_seconds=60
+                    )
+                )
+            )
+            source_task_count += 1
+        else:
+            activity("watcher_skipped", source="Facebook", reason="not_configured")
+            console.print(
+                "[yellow]Facebook skipped: APIFY_API_TOKEN or FACEBOOK_QUERIES is missing.[/yellow]"
+            )
 
         if source_task_count == 0:
             console.print(
@@ -2189,9 +2489,14 @@ def telegram_status() -> None:
             f"Web / Direct monitor: {'ready' if _direct_web_configured() else 'not configured'} ({WEB_DIRECT_WATCH_INTERVAL_SECONDS}s)",
             f"Podcast / RSS monitor: {'ready' if _podcast_configured() else 'not configured'} ({PODCAST_INDEX_WATCH_INTERVAL_SECONDS}s)",
             f"Validator browser fallback: {'ready' if VALIDATOR_BROWSER_FALLBACK_ENABLED else 'off'}",
-            f"Reddit: {'ready' if _reddit_configured() else 'pending / not configured'}",
-            f"Threads: {'ready' if _threads_configured() else 'pending / not configured'}",
+            f"Scrape Creators API: {'ready' if SCRAPE_CREATORS_API_KEY else 'not configured'}",
+            f"Threads / Scrape Creators: {'ready' if _threads_configured() else 'not configured'} ({THREADS_WATCH_INTERVAL_SECONDS}s)",
+            f"Reddit / Scrape Creators: {'ready' if _reddit_configured() else 'not configured'} ({REDDIT_WATCH_INTERVAL_SECONDS}s)",
+            f"Apify API: {'ready' if get_apify_token() else 'not configured'}",
+            f"Instagram / Apify: {'ready' if _instagram_configured() else 'not configured'} ({INSTAGRAM_WATCH_INTERVAL_SECONDS}s)",
+            f"Facebook / Apify: {'ready' if _facebook_configured() else 'not configured'} ({FACEBOOK_WATCH_INTERVAL_SECONDS}s)",
             f"Telegram destinations: {len(TELEGRAM_CHAT_IDS)}",
+            f"Telegram key-rotation admins: {len(TELEGRAM_ADMIN_CHAT_IDS)}",
             f"Status generated: {datetime.now(timezone.utc).isoformat()}",
         ]
         successful, failures = await send_telegram_message_all(
@@ -2222,17 +2527,74 @@ def status() -> None:
             "Validator browser",
             f"{VALIDATOR_BROWSER_CHANNEL or 'chromium'} ({'headless' if VALIDATOR_BROWSER_HEADLESS else 'visible'})",
         )
-    table.add_row("Threads", "yes" if _threads_configured() else "no")
-    table.add_row("Threads OAuth app", "yes" if _threads_oauth_configured() else "no")
-    table.add_row(
-        "Threads token source",
-        ".env" if THREADS_ACCESS_TOKEN else (THREADS_TOKEN_FILE if _threads_token_record() else "-")
+
+    table.add_row("Scrape Creators API", "yes" if SCRAPE_CREATORS_API_KEY else "no")
+    scrape_requests_threads = _monthly_scrape_creator_requests(
+        THREADS_WATCH_INTERVAL_SECONDS, len(THREADS_QUERIES)
     )
+    scrape_requests_reddit = _monthly_scrape_creator_requests(
+        REDDIT_WATCH_INTERVAL_SECONDS, len(REDDIT_QUERIES)
+    )
+    table.add_row(
+        "Scrape Creators est. total / 30d",
+        str(scrape_requests_threads + scrape_requests_reddit),
+    )
+    apify_runs_instagram = _monthly_apify_runs(
+        INSTAGRAM_WATCH_INTERVAL_SECONDS, len(INSTAGRAM_QUERIES)
+    )
+    apify_runs_facebook = _monthly_apify_runs(
+        FACEBOOK_WATCH_INTERVAL_SECONDS, len(FACEBOOK_QUERIES)
+    )
+    table.add_row("Apify API", masked_apify_token())
+    table.add_row(
+        "Apify est. Actor runs / 30d",
+        str(apify_runs_instagram + apify_runs_facebook),
+    )
+    table.add_row(
+        "Telegram Apify rotation",
+        "ready" if TELEGRAM_ADMIN_CHAT_IDS and RENDER_API_KEY and RENDER_SERVICE_ID else "not fully configured",
+    )
+    table.add_row("Threads / Scrape Creators", "yes" if _threads_configured() else "no")
     table.add_row("Threads interval", f"{THREADS_WATCH_INTERVAL_SECONDS}s")
-    table.add_row("Threads queries", ", ".join(THREADS_QUERIES) or "-")
-    table.add_row("Reddit", "yes" if _reddit_configured() else "no")
+    table.add_row("Threads lookback", f"{THREADS_LOOKBACK_MINUTES} min")
+    table.add_row("Threads queries", " | ".join(THREADS_QUERIES) or "-")
+    table.add_row(
+        "Threads est. requests / 30d",
+        str(scrape_requests_threads),
+    )
+
+    table.add_row("Reddit / Scrape Creators", "yes" if _reddit_configured() else "no")
     table.add_row("Reddit interval", f"{REDDIT_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Reddit lookback", f"{REDDIT_LOOKBACK_MINUTES} min")
     table.add_row("Reddit queries", " | ".join(REDDIT_QUERIES) or "-")
+    table.add_row("Reddit search mode", f"{REDDIT_SCRAPE_FILTER} / new / {REDDIT_SCRAPE_TIMEFRAME}")
+    table.add_row(
+        "Reddit est. requests / 30d",
+        str(scrape_requests_reddit),
+    )
+
+    table.add_row("Instagram / Apify", "yes" if _instagram_configured() else "no")
+    table.add_row("Instagram interval", f"{INSTAGRAM_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Instagram lookback", f"{INSTAGRAM_LOOKBACK_MINUTES} min")
+    table.add_row("Instagram queries", " | ".join(INSTAGRAM_QUERIES) or "-")
+    table.add_row("Instagram Actor", APIFY_INSTAGRAM_ACTOR_ID)
+    table.add_row("Instagram est. runs / 30d", str(apify_runs_instagram))
+
+    table.add_row("Facebook / Apify", "yes" if _facebook_configured() else "no")
+    table.add_row("Facebook interval", f"{FACEBOOK_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Facebook lookback", f"{FACEBOOK_LOOKBACK_MINUTES} min")
+    table.add_row("Facebook queries", " | ".join(FACEBOOK_QUERIES) or "-")
+    table.add_row("Facebook Actor", APIFY_FACEBOOK_ACTOR_ID)
+    table.add_row("Facebook est. runs / 30d", str(apify_runs_facebook))
+
+    # The legacy official Threads OAuth path remains in the codebase for backwards
+    # compatibility, but watch-all no longer depends on it.
+    table.add_row("Legacy Threads OAuth app", "yes" if _threads_oauth_configured() else "no")
+    table.add_row(
+        "Legacy Threads token source",
+        ".env" if THREADS_ACCESS_TOKEN else (THREADS_TOKEN_FILE if _threads_token_record() else "-"),
+    )
+
     table.add_row("YouTube", "yes" if _youtube_configured() else "no")
     table.add_row("YouTube interval", f"{YOUTUBE_WATCH_INTERVAL_SECONDS}s")
     table.add_row("YouTube queries", " | ".join(YOUTUBE_QUERIES) or "-")

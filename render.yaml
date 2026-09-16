@@ -6,6 +6,68 @@ services:
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
+      - key: SCRAPE_CREATORS_API_KEY
+        sync: false
+      - key: SCRAPE_CREATORS_TIMEOUT_SECONDS
+        value: 30
+      - key: THREADS_WATCH_INTERVAL_SECONDS
+        value: 300
+      - key: THREADS_LOOKBACK_MINUTES
+        value: 7
+      - key: THREADS_QUERIES
+        value: claude referral
+      - key: REDDIT_WATCH_INTERVAL_SECONDS
+        value: 300
+      - key: REDDIT_LOOKBACK_MINUTES
+        value: 7
+      - key: REDDIT_QUERIES
+        value: claude referral
+      - key: REDDIT_SCRAPE_FILTER
+        value: posts
+      - key: REDDIT_SCRAPE_TIMEFRAME
+        value: day
+      - key: APIFY_API_TOKEN
+        sync: false
+      - key: APIFY_TIMEOUT_SECONDS
+        value: 150
+      - key: APIFY_MAX_RUN_COST_USD
+        value: 0.10
+      - key: APIFY_FACEBOOK_ACTOR_ID
+        value: memo23~facebook-search-scraper
+      - key: APIFY_INSTAGRAM_ACTOR_ID
+        value: scraping_solutions~instagram-boolean-search-scraper-posts-reels
+      - key: APIFY_RENDER_AUTO_DEPLOY
+        value: true
+      - key: INSTAGRAM_WATCH_INTERVAL_SECONDS
+        value: 900
+      - key: INSTAGRAM_LOOKBACK_MINUTES
+        value: 17
+      - key: INSTAGRAM_QUERIES
+        value: claude referral
+      - key: INSTAGRAM_SEARCH_LIMIT
+        value: 10
+      - key: INSTAGRAM_CONTENT_TYPE
+        value: posts_and_reels
+      - key: INSTAGRAM_SEARCH_COVERAGE
+        value: efficient
+      - key: INSTAGRAM_HASHTAG_FEED_TYPE
+        value: recent
+      - key: FACEBOOK_WATCH_INTERVAL_SECONDS
+        value: 600
+      - key: FACEBOOK_LOOKBACK_MINUTES
+        value: 12
+      - key: FACEBOOK_QUERIES
+        value: claude referral
+      - key: FACEBOOK_SEARCH_LIMIT
+        value: 10
+      - key: FACEBOOK_PAGE_DELAY_MS
+        value: 800
+      - key: TELEGRAM_ADMIN_CHAT_IDS
+        sync: false
+      - key: RENDER_API_KEY
+        sync: false
+      - key: RENDER_SERVICE_ID
+        sync: false
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /ms-playwright
       - key: VALIDATOR_BROWSER_PROFILE_DIR
