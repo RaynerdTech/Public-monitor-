@@ -15,6 +15,7 @@ from app.services.apify import ApifyClient
 from app.services.render_env import persist_render_env_var
 from app.services.runtime_secrets import get_apify_token, masked_apify_token, set_apify_token
 from app.services.telegram import delete_telegram_message, send_telegram_message
+from app.services.credit_monitor import check_apify_credit_once, credit_status_text
 
 
 def parse_apify_token_command(text: object) -> str | None:
@@ -75,6 +76,14 @@ async def handle_telegram_admin_message(message: dict) -> bool:
         )
         return True
 
+    if isinstance(text, str) and text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower() in {"/credits", "/credit_status"}:
+        if not is_admin_chat(chat_id):
+            await send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id, "Not authorized for admin commands.")
+            return True
+        await check_apify_credit_once()
+        await send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id, credit_status_text())
+        return True
+
     token = parse_apify_token_command(text)
     if token is None:
         return False
@@ -130,6 +139,7 @@ async def handle_telegram_admin_message(message: dict) -> bool:
     # Switch the currently running watchers immediately. They read the token on
     # every Actor call rather than only at process startup.
     set_apify_token(token)
+    await check_apify_credit_once()
 
     username = str(account.get("username") or "Apify account")
     if not (RENDER_API_KEY and RENDER_SERVICE_ID):

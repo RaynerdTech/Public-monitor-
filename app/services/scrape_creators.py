@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.core.activity_log import activity
+from app.services.credit_monitor import observe_scrape_creators_balance
 
 
 SCRAPE_CREATORS_BASE_URL = "https://api.scrapecreators.com"
@@ -117,6 +118,7 @@ class ScrapeCreatorsClient:
             credits_charged=charged,
             credits_remaining=remaining,
         )
+        await observe_scrape_creators_balance(remaining)
         return ScrapeCreatorsResponse(
             payload=payload,
             credits_charged=charged,

@@ -52,6 +52,16 @@ class ApifyClient:
         data = payload.get("data") if isinstance(payload, dict) else None
         return data if isinstance(data, dict) else {}
 
+    async def get_limits(self) -> dict[str, Any]:
+        """Return Apify account limits/current usage for credit forecasting."""
+        headers = {"Authorization": f"Bearer {self._token()}", "Accept": "application/json"}
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            response = await client.get(f"{self.base_url}/users/me/limits", headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        return data if isinstance(data, dict) else {}
+
     async def run_actor(
         self,
         actor_id: str,

@@ -110,6 +110,7 @@ from app.core.activity_log import activity
 from app.core.extractor import extract_referral_code, extract_referral_links
 from app.services.pipeline import process_post
 from app.services.runtime_secrets import get_apify_token, masked_apify_token
+from app.services.credit_monitor import run_credit_monitor
 from app.services.retry_queue import run_retry_queues, run_telegram_feedback_loop
 from app.services.threads_oauth import (
     build_threads_authorization_url,
@@ -151,7 +152,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.5.0"
+APP_VERSION = "10.6.0"
 _threads_persistence_lock = threading.Lock()
 
 
@@ -2128,6 +2129,7 @@ def watch_all() -> None:
         tasks: list[asyncio.Task] = [asyncio.create_task(run_retry_queues())]
         if TELEGRAM_BOT_TOKEN and (TELEGRAM_CHAT_IDS or TELEGRAM_ADMIN_CHAT_IDS):
             tasks.append(asyncio.create_task(run_telegram_feedback_loop()))
+            tasks.append(asyncio.create_task(run_credit_monitor()))
         source_task_count = 0
         activity(
             "monitor_starting",

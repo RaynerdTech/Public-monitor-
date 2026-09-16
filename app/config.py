@@ -33,7 +33,34 @@ APIFY_INSTAGRAM_ACTOR_ID = (
     ).strip()
     or "scraping_solutions~instagram-boolean-search-scraper-posts-reels"
 )
-APIFY_RENDER_AUTO_DEPLOY = _env_bool("APIFY_RENDER_AUTO_DEPLOY", True)
+APIFY_RENDER_AUTO_DEPLOY = _env_bool("APIFY_RENDER_AUTO_DEPLOY", False)
+
+# Credit exhaustion forecasting. Apify run-cost defaults come from the live
+# Facebook/Instagram Actors tested for this deployment and remain overrideable.
+APIFY_FACEBOOK_ESTIMATED_RUN_COST_USD = max(
+    0.0, float(os.getenv("APIFY_FACEBOOK_ESTIMATED_RUN_COST_USD", "0.024"))
+)
+APIFY_INSTAGRAM_ESTIMATED_RUN_COST_USD = max(
+    0.0, float(os.getenv("APIFY_INSTAGRAM_ESTIMATED_RUN_COST_USD", "0.027"))
+)
+CREDIT_MONITOR_INTERVAL_SECONDS = max(
+    60, int(os.getenv("CREDIT_MONITOR_INTERVAL_SECONDS", "300"))
+)
+
+def _credit_alert_thresholds() -> list[float]:
+    raw = os.getenv("CREDIT_ALERT_THRESHOLDS_HOURS", "72,24,6,3,1")
+    values: list[float] = []
+    for item in raw.split(","):
+        try:
+            value = float(item.strip())
+        except ValueError:
+            continue
+        if value > 0 and value not in values:
+            values.append(value)
+    return sorted(values, reverse=True) or [72.0, 24.0, 6.0, 3.0, 1.0]
+
+
+CREDIT_ALERT_THRESHOLDS_HOURS = _credit_alert_thresholds()
 
 
 def _telegram_chat_ids() -> list[str]:
@@ -244,7 +271,7 @@ WEB_DIRECT_WATCH_INTERVAL_SECONDS = max(
     30, int(os.getenv("WEB_DIRECT_WATCH_INTERVAL_SECONDS", "120"))
 )
 WEB_DIRECT_LOOKBACK_MINUTES = max(
-    5, int(os.getenv("WEB_DIRECT_LOOKBACK_MINUTES", "180"))
+    5, int(os.getenv("WEB_DIRECT_LOOKBACK_MINUTES", "5"))
 )
 WEB_DIRECT_TIMEOUT_SECONDS = max(
     3, int(os.getenv("WEB_DIRECT_TIMEOUT_SECONDS", "15"))
