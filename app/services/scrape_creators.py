@@ -118,7 +118,7 @@ class ScrapeCreatorsClient:
             credits_charged=charged,
             credits_remaining=remaining,
         )
-        await observe_scrape_creators_balance(remaining)
+        await observe_scrape_creators_balance(remaining, credits_charged=charged)
         return ScrapeCreatorsResponse(
             payload=payload,
             credits_charged=charged,

@@ -40,6 +40,8 @@ class _AlertState:
 
 @dataclass
 class _ApifyUsageState:
+    baseline_usage_usd: float | None = None
+    baseline_checked_at: datetime | None = None
     last_usage_usd: float | None = None
     last_checked_at: datetime | None = None
     observed_burn_per_hour: float | None = None
@@ -49,6 +51,7 @@ _alert_states: dict[str, _AlertState] = {}
 _apify_usage_states: dict[str, _ApifyUsageState] = {}
 _last_scrape_creators_balance: int | None = None
 _last_scrape_creators_hours: float | None = None
+_scrape_creators_suspect_balance: int | None = None
 _last_apify_remaining_usd: float | None = None
 _last_apify_hours: float | None = None
 
@@ -158,10 +161,15 @@ async def _evaluate_balance(
     state = _alert_states.setdefault(state_key, _AlertState())
     hours = estimate_hours_remaining(remaining, burn_per_hour)
 
-    # A top-up or a newly larger allowance starts a fresh warning cycle.
+    # Only a meaningful top-up starts a fresh warning cycle. Small increases can
+    # happen when concurrent requests finish out of order and must not cause the
+    # same low-credit warning to fire again.
     if state.last_remaining is not None and remaining > state.last_remaining:
-        state.alerted_thresholds.clear()
-        state.exhausted_sent = False
+        increase = remaining - state.last_remaining
+        reset_threshold = max(1.0, abs(state.last_remaining) * 0.02)
+        if increase >= reset_threshold:
+            state.alerted_thresholds.clear()
+            state.exhausted_sent = False
 
     state.last_remaining = remaining
     state.last_hours_remaining = hours
@@ -201,11 +209,50 @@ async def _evaluate_balance(
     return hours
 
 
-async def observe_scrape_creators_balance(remaining_credits: int | None) -> None:
-    """Observe the balance already returned by normal Scrape Creators requests."""
+def _scrape_balance_is_suspicious(previous: int | None, current: int) -> bool:
+    """Reject one-off catastrophic drops until a second request confirms them."""
+    if previous is None or previous < 100:
+        return False
+    return current < (previous * 0.25)
+
+
+async def observe_scrape_creators_balance(
+    remaining_credits: int | None,
+    *,
+    credits_charged: int = 0,
+) -> None:
+    """Observe the balance already returned by normal Scrape Creators requests.
+
+    A few Scrape Creators endpoints can occasionally surface a transient/incorrect
+    balance. A single >75% drop is therefore held for confirmation instead of
+    immediately alarming Telegram. The next similarly-low reading confirms it.
+    """
     global _last_scrape_creators_balance, _last_scrape_creators_hours
+    global _scrape_creators_suspect_balance
     if remaining_credits is None:
         return
+
+    remaining_credits = int(remaining_credits)
+    previous = _last_scrape_creators_balance
+    if _scrape_balance_is_suspicious(previous, remaining_credits):
+        suspect = _scrape_creators_suspect_balance
+        confirmation_tolerance = max(10, int(max(1, suspect or remaining_credits) * 0.05))
+        if suspect is None or abs(remaining_credits - suspect) > confirmation_tolerance:
+            _scrape_creators_suspect_balance = remaining_credits
+            activity(
+                "credit_balance_anomaly_ignored",
+                provider="Scrape Creators",
+                previous_balance=previous,
+                reported_balance=remaining_credits,
+                credits_charged=credits_charged,
+                level="WARNING",
+            )
+            return
+        # Two consecutive low readings agree closely enough: accept the real drop.
+        _scrape_creators_suspect_balance = None
+    else:
+        _scrape_creators_suspect_balance = None
+
     burn = scrape_creators_burn_per_hour()
     try:
         hours = await _evaluate_balance(
@@ -216,7 +263,7 @@ async def observe_scrape_creators_balance(remaining_credits: int | None) -> None
             unit_label="credits",
             remaining_display=f"{remaining_credits:,} credits",
         )
-        _last_scrape_creators_balance = int(remaining_credits)
+        _last_scrape_creators_balance = remaining_credits
         _last_scrape_creators_hours = hours
     except Exception as exc:
         # Credit alerts must never break the source request that discovered the balance.
@@ -249,25 +296,48 @@ async def _apify_limits() -> tuple[float, float, str] | None:
 
 
 def _observed_apify_burn_per_hour(key: str, used_usd: float) -> float | None:
+    """Estimate Apify burn from a stable window, not one five-minute sample.
+
+    Actor charges are stepwise. Extrapolating one short interval can turn a single
+    expensive run into a nonsense $40+/day forecast. We require at least 30
+    minutes of observations from the current token before using measured burn.
+    """
     now = datetime.now(timezone.utc)
     state = _apify_usage_states.setdefault(key, _ApifyUsageState())
-    observed: float | None = None
-    if state.last_usage_usd is not None and state.last_checked_at is not None:
-        elapsed_hours = (now - state.last_checked_at).total_seconds() / 3600
-        delta = used_usd - state.last_usage_usd
-        if elapsed_hours >= (CREDIT_MONITOR_INTERVAL_SECONDS * 0.75) / 3600 and delta >= 0:
-            raw = delta / elapsed_hours
-            if raw > 0:
-                if state.observed_burn_per_hour is None:
-                    state.observed_burn_per_hour = raw
-                else:
-                    # Smooth stepwise Actor billing so one expensive run does not
-                    # wildly change the exhaustion estimate.
-                    state.observed_burn_per_hour = (state.observed_burn_per_hour * 0.65) + (raw * 0.35)
-                observed = state.observed_burn_per_hour
+
+    if (
+        state.baseline_usage_usd is None
+        or state.baseline_checked_at is None
+        or used_usd < state.baseline_usage_usd
+    ):
+        state.baseline_usage_usd = used_usd
+        state.baseline_checked_at = now
+        state.observed_burn_per_hour = None
+
     state.last_usage_usd = used_usd
     state.last_checked_at = now
-    return observed or state.observed_burn_per_hour
+
+    elapsed_hours = (now - state.baseline_checked_at).total_seconds() / 3600
+    if elapsed_hours < 0.5:
+        return None
+
+    delta = used_usd - state.baseline_usage_usd
+    if delta <= 0:
+        return state.observed_burn_per_hour
+
+    raw = delta / elapsed_hours
+    fallback = apify_estimated_burn_per_hour()
+    # The configured estimate is based on our measured Actor costs. Keep the
+    # observed correction conservative so manual tests/startup bursts do not
+    # create wild Telegram forecasts.
+    if fallback > 0:
+        raw = min(raw, fallback * 2.0)
+
+    if state.observed_burn_per_hour is None:
+        state.observed_burn_per_hour = raw
+    else:
+        state.observed_burn_per_hour = (state.observed_burn_per_hour * 0.75) + (raw * 0.25)
+    return state.observed_burn_per_hour
 
 
 async def check_apify_credit_once() -> tuple[float | None, float | None]:
@@ -280,7 +350,9 @@ async def check_apify_credit_once() -> tuple[float | None, float | None]:
         remaining_usd, used_usd, key = result
         observed_burn = _observed_apify_burn_per_hour(key, used_usd)
         fallback_burn = apify_estimated_burn_per_hour()
-        burn = observed_burn if observed_burn and observed_burn > 0 else fallback_burn
+        # Never forecast lower than our configured measured-cost estimate. Once
+        # a 30-minute observation window exists, allow it to raise the estimate.
+        burn = max(fallback_burn, observed_burn or 0.0)
         hours = await _evaluate_balance(
             state_key=f"apify:{key}",
             provider="Apify",
