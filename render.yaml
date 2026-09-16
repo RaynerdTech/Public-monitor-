@@ -30,3 +30,9 @@ services:
         value: true
       - key: YOUTUBE_LOOKBACK_MINUTES
         value: 360
+      - key: WEB_DIRECT_SOURCES
+        sync: false
+      - key: WEB_DIRECT_WATCH_INTERVAL_SECONDS
+        value: 120
+      - key: PODCAST_TRANSCRIPT_RETRIES
+        value: 2

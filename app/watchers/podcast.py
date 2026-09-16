@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -234,6 +235,8 @@ class PodcastWatcher(BaseWatcher):
         rss_interval_seconds: int = 120,
         rss_max_feeds: int = 100,
         source_registry_path: str = "podcast_sources.json",
+        transcript_retries: int = 2,
+        transcript_failure_log_seconds: int = 900,
         status_callback=None,
     ) -> None:
         self.api_key = api_key.strip()
@@ -249,6 +252,10 @@ class PodcastWatcher(BaseWatcher):
         self.rss_interval_seconds = max(30, int(rss_interval_seconds))
         self.rss_max_feeds = max(1, int(rss_max_feeds))
         self.source_registry_path = Path(source_registry_path)
+        self.transcript_retries = max(1, int(transcript_retries))
+        self.transcript_failure_log_seconds = max(
+            60, int(transcript_failure_log_seconds)
+        )
         self.status_callback = status_callback or (lambda _message: None)
 
         self._since = int(time.time()) - self.lookback_minutes * 60
@@ -262,6 +269,8 @@ class PodcastWatcher(BaseWatcher):
         self._last_index_relevant = 0
         self._last_recent_feeds_promoted = 0
         self._last_transcripts_checked = 0
+        self._last_transcript_failures = 0
+        self._transcript_failure_logged_at: dict[str, float] = {}
         self._last_rss_polled = 0
         self._feeds: dict[str, dict] = self._load_registry()
 
@@ -413,17 +422,46 @@ class PodcastWatcher(BaseWatcher):
         }
         for url in _episode_transcript_urls(episode)[:3]:
             self._last_transcripts_checked += 1
-            try:
-                response = await client.get(url, headers=headers, follow_redirects=True)
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                activity(
-                    "podcast_transcript_fetch_failed",
-                    source="Podcast / RSS",
-                    url=url,
-                    error_type=type(exc).__name__,
-                    level="WARNING",
-                )
+            final_error: httpx.HTTPError | None = None
+            response: httpx.Response | None = None
+            for attempt in range(self.transcript_retries):
+                try:
+                    response = await client.get(
+                        url,
+                        headers=headers,
+                        follow_redirects=True,
+                        timeout=httpx.Timeout(12.0, connect=6.0),
+                    )
+                    response.raise_for_status()
+                    final_error = None
+                    break
+                except httpx.HTTPStatusError as exc:
+                    final_error = exc
+                    # Retry rate limits and server failures, not permanent 4xx.
+                    if exc.response.status_code < 500 and exc.response.status_code != 429:
+                        break
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    final_error = exc
+                if attempt + 1 < self.transcript_retries:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+
+            if final_error is not None or response is None:
+                self._last_transcript_failures += 1
+                host = urlparse(url).netloc or "unknown"
+                now = time.monotonic()
+                last_logged = self._transcript_failure_logged_at.get(host, 0.0)
+                if now - last_logged >= self.transcript_failure_log_seconds:
+                    fields = {
+                        "source": "Podcast / RSS",
+                        "host": host,
+                        "error_type": type(final_error).__name__,
+                        "attempts": self.transcript_retries,
+                        "level": "WARNING",
+                    }
+                    if isinstance(final_error, httpx.HTTPStatusError):
+                        fields["http_status"] = final_error.response.status_code
+                    activity("podcast_transcript_host_unreachable", **fields)
+                    self._transcript_failure_logged_at[host] = now
                 continue
 
             content_type = (response.headers.get("content-type") or "").lower()
@@ -451,6 +489,7 @@ class PodcastWatcher(BaseWatcher):
         self._last_index_relevant = 0
         self._last_recent_feeds_promoted = 0
         self._last_transcripts_checked = 0
+        self._last_transcript_failures = 0
         cursor = self._since
         newest_added = cursor
         published_cutoff = datetime.now(timezone.utc) - timedelta(
@@ -759,6 +798,7 @@ class PodcastWatcher(BaseWatcher):
             relevant_candidates=self._last_index_relevant,
             recent_feeds_promoted=self._last_recent_feeds_promoted,
             transcripts_checked=self._last_transcripts_checked,
+            transcript_failures=self._last_transcript_failures,
         )
         return unique
 

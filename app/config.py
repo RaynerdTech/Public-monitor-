@@ -168,6 +168,26 @@ EXA_QUERIES = [
     if query.strip()
 ]
 
+# Poll known publishing sites directly so new posts do not have to wait for Exa
+# or another search engine to index them. Values may be base sites, feeds, or maps.
+WEB_DIRECT_SOURCES = [
+    source.strip()
+    for source in os.getenv("WEB_DIRECT_SOURCES", "").split("||")
+    if source.strip()
+]
+WEB_DIRECT_WATCH_INTERVAL_SECONDS = max(
+    30, int(os.getenv("WEB_DIRECT_WATCH_INTERVAL_SECONDS", "120"))
+)
+WEB_DIRECT_LOOKBACK_MINUTES = max(
+    5, int(os.getenv("WEB_DIRECT_LOOKBACK_MINUTES", "180"))
+)
+WEB_DIRECT_TIMEOUT_SECONDS = max(
+    3, int(os.getenv("WEB_DIRECT_TIMEOUT_SECONDS", "15"))
+)
+WEB_DIRECT_MAX_PAGES_PER_POLL = max(
+    1, int(os.getenv("WEB_DIRECT_MAX_PAGES_PER_POLL", "50"))
+)
+
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 X_WATCH_INTERVAL_SECONDS = max(10, int(os.getenv("X_WATCH_INTERVAL_SECONDS", "20")))
 X_SEARCH_LIMIT = min(100, max(10, int(os.getenv("X_SEARCH_LIMIT", "100"))))
@@ -228,4 +248,10 @@ PODCAST_RSS_MAX_FEEDS = max(
 PODCAST_SOURCE_REGISTRY = (
     os.getenv("PODCAST_SOURCE_REGISTRY", "podcast_sources.json").strip()
     or "podcast_sources.json"
+)
+PODCAST_TRANSCRIPT_RETRIES = max(
+    1, int(os.getenv("PODCAST_TRANSCRIPT_RETRIES", "2"))
+)
+PODCAST_TRANSCRIPT_FAILURE_LOG_SECONDS = max(
+    60, int(os.getenv("PODCAST_TRANSCRIPT_FAILURE_LOG_SECONDS", "900"))
 )

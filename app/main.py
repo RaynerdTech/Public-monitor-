@@ -19,6 +19,11 @@ from app.config import (
     EXA_PAGE_FETCH_TIMEOUT_SECONDS,
     EXA_LOOKBACK_MINUTES,
     EXA_API_KEY,
+    WEB_DIRECT_LOOKBACK_MINUTES,
+    WEB_DIRECT_MAX_PAGES_PER_POLL,
+    WEB_DIRECT_SOURCES,
+    WEB_DIRECT_TIMEOUT_SECONDS,
+    WEB_DIRECT_WATCH_INTERVAL_SECONDS,
     PODCAST_DISCOVERY_INTERVAL_SECONDS,
     PODCAST_DISCOVERY_QUERIES,
     PODCAST_INDEX_API_KEY,
@@ -30,6 +35,8 @@ from app.config import (
     PODCAST_RSS_INTERVAL_SECONDS,
     PODCAST_RSS_MAX_FEEDS,
     PODCAST_SOURCE_REGISTRY,
+    PODCAST_TRANSCRIPT_FAILURE_LOG_SECONDS,
+    PODCAST_TRANSCRIPT_RETRIES,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_IDS,
     REDDIT_CLIENT_ID,
@@ -102,6 +109,7 @@ from app.watchers.base import SourcePost
 from app.watchers.file import FileWatcher
 from app.watchers.podcast import PodcastWatcher
 from app.watchers.reddit import RedditWatcher
+from app.watchers.sites import DirectWebsiteWatcher
 from app.watchers.threads import ThreadsWatcher
 from app.watchers.url import UrlWatcher
 from app.watchers.youtube import YouTubeWatcher
@@ -111,7 +119,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.2"
+APP_VERSION = "10.3"
 _threads_persistence_lock = threading.Lock()
 
 
@@ -228,6 +236,10 @@ def _x_configured() -> bool:
 
 def _web_configured() -> bool:
     return bool(EXA_API_KEY and EXA_QUERIES)
+
+
+def _direct_web_configured() -> bool:
+    return bool(WEB_DIRECT_SOURCES)
 
 
 def _podcast_configured() -> bool:
@@ -1401,6 +1413,41 @@ def watch_web(
         console.print("\n[yellow]Web watcher stopped.[/yellow]")
 
 
+@cli.command("direct-web-test")
+def direct_web_test() -> None:
+    """Run one feed/sitemap cycle for configured direct web sources."""
+
+    async def run() -> None:
+        if not _direct_web_configured():
+            console.print(
+                "[red]Set WEB_DIRECT_SOURCES to one or more sites, feeds, or sitemaps first.[/red]"
+            )
+            raise typer.Exit(1)
+        watcher = DirectWebsiteWatcher(
+            WEB_DIRECT_SOURCES,
+            interval_seconds=WEB_DIRECT_WATCH_INTERVAL_SECONDS,
+            lookback_minutes=WEB_DIRECT_LOOKBACK_MINUTES,
+            timeout_seconds=WEB_DIRECT_TIMEOUT_SECONDS,
+            max_pages_per_poll=WEB_DIRECT_MAX_PAGES_PER_POLL,
+            status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+        )
+        posts = await watcher.fetch()
+        table = Table("Source", "Published", "URL", "Referral?")
+        for post in posts:
+            table.add_row(
+                post.source,
+                post.created_at.isoformat() if post.created_at else "-",
+                post.url or "-",
+                "yes" if extract_referral_links(post.text) else "no",
+            )
+        console.print(table)
+        console.print(
+            f"[green]Direct website check completed. {len(posts)} referral post(s) found.[/green]"
+        )
+
+    asyncio.run(run())
+
+
 @cli.command("podcast-test")
 def podcast_test() -> None:
     """Verify Podcast Index auth and run one discovery/recent/RSS cycle."""
@@ -1424,6 +1471,8 @@ def podcast_test() -> None:
             rss_interval_seconds=PODCAST_RSS_INTERVAL_SECONDS,
             rss_max_feeds=PODCAST_RSS_MAX_FEEDS,
             source_registry_path=PODCAST_SOURCE_REGISTRY,
+            transcript_retries=PODCAST_TRANSCRIPT_RETRIES,
+            transcript_failure_log_seconds=PODCAST_TRANSCRIPT_FAILURE_LOG_SECONDS,
             status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
         )
         try:
@@ -1491,6 +1540,8 @@ def watch_podcasts(
             rss_interval_seconds=PODCAST_RSS_INTERVAL_SECONDS,
             rss_max_feeds=PODCAST_RSS_MAX_FEEDS,
             source_registry_path=PODCAST_SOURCE_REGISTRY,
+            transcript_retries=PODCAST_TRANSCRIPT_RETRIES,
+            transcript_failure_log_seconds=PODCAST_TRANSCRIPT_FAILURE_LOG_SECONDS,
             status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
         )
         console.print(
@@ -1939,6 +1990,30 @@ def watch_all() -> None:
             activity("watcher_skipped", source="Web / Exa", reason="not_configured", level="WARNING")
             console.print("[yellow]Web / Exa skipped: not configured.[/yellow]")
 
+        if _direct_web_configured():
+            direct_web_watcher = DirectWebsiteWatcher(
+                WEB_DIRECT_SOURCES,
+                interval_seconds=WEB_DIRECT_WATCH_INTERVAL_SECONDS,
+                lookback_minutes=WEB_DIRECT_LOOKBACK_MINUTES,
+                timeout_seconds=WEB_DIRECT_TIMEOUT_SECONDS,
+                max_pages_per_poll=WEB_DIRECT_MAX_PAGES_PER_POLL,
+                status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
+            )
+            tasks.append(
+                asyncio.create_task(
+                    _run_configured_monitor_stream(
+                        "Web / Direct", direct_web_watcher, retry_seconds=30
+                    )
+                )
+            )
+            source_task_count += 1
+        else:
+            activity(
+                "watcher_skipped",
+                source="Web / Direct",
+                reason="not_configured",
+            )
+
         if _podcast_configured():
             podcast_watcher = PodcastWatcher(
                 PODCAST_INDEX_API_KEY,
@@ -1952,6 +2027,8 @@ def watch_all() -> None:
                 rss_interval_seconds=PODCAST_RSS_INTERVAL_SECONDS,
                 rss_max_feeds=PODCAST_RSS_MAX_FEEDS,
                 source_registry_path=PODCAST_SOURCE_REGISTRY,
+                transcript_retries=PODCAST_TRANSCRIPT_RETRIES,
+                transcript_failure_log_seconds=PODCAST_TRANSCRIPT_FAILURE_LOG_SECONDS,
                 status_callback=lambda message: console.print(f"[yellow]{message}[/yellow]"),
             )
             tasks.append(
@@ -2109,6 +2186,7 @@ def telegram_status() -> None:
             f"X live stream: {'ready' if X_BEARER_TOKEN else 'not configured'}",
             f"YouTube monitor: {'ready' if YOUTUBE_API_KEY else 'not configured'} ({YOUTUBE_WATCH_INTERVAL_SECONDS}s)",
             f"Web / Exa monitor: {'ready' if EXA_API_KEY else 'not configured'} ({EXA_WATCH_INTERVAL_SECONDS}s)",
+            f"Web / Direct monitor: {'ready' if _direct_web_configured() else 'not configured'} ({WEB_DIRECT_WATCH_INTERVAL_SECONDS}s)",
             f"Podcast / RSS monitor: {'ready' if _podcast_configured() else 'not configured'} ({PODCAST_INDEX_WATCH_INTERVAL_SECONDS}s)",
             f"Validator browser fallback: {'ready' if VALIDATOR_BROWSER_FALLBACK_ENABLED else 'off'}",
             f"Reddit: {'ready' if _reddit_configured() else 'pending / not configured'}",
@@ -2162,6 +2240,9 @@ def status() -> None:
     table.add_row("Web interval", f"{EXA_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Web search type", EXA_SEARCH_TYPE)
     table.add_row("Web queries", " | ".join(EXA_QUERIES) or "-")
+    table.add_row("Web / Direct", "yes" if _direct_web_configured() else "no")
+    table.add_row("Direct web interval", f"{WEB_DIRECT_WATCH_INTERVAL_SECONDS}s")
+    table.add_row("Direct web sources", " | ".join(WEB_DIRECT_SOURCES) or "-")
     table.add_row("Podcast / RSS", "yes" if _podcast_configured() else "no")
     table.add_row("Podcast Index interval", f"{PODCAST_INDEX_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Podcast RSS interval", f"{PODCAST_RSS_INTERVAL_SECONDS}s")

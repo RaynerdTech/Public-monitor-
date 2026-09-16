@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
 from app.watchers.podcast import (
@@ -256,6 +257,34 @@ async def test_transcript_json_unescapes_referral_url(tmp_path):
         {"transcripts": [{"url": "https://example.com/transcript.json"}]},
     )
     assert "https://claude.ai/referral/json-code" in text
+
+
+@pytest.mark.anyio
+async def test_transcript_connect_error_retries_without_stopping_watcher(tmp_path):
+    watcher = PodcastWatcher(
+        "key",
+        "secret",
+        "ReferralMonitor/0.9",
+        transcript_retries=2,
+        source_registry_path=str(tmp_path / "podcast-sources.json"),
+    )
+
+    class Client:
+        calls = 0
+
+        async def get(self, url, **_kwargs):
+            self.calls += 1
+            raise httpx.ConnectError("unreachable", request=httpx.Request("GET", url))
+
+    client = Client()
+    text = await watcher._fetch_episode_transcripts(
+        client,
+        {"transcripts": [{"url": "https://cdn.example.com/transcript.vtt"}]},
+    )
+
+    assert text == ""
+    assert client.calls == 2
+    assert watcher._last_transcript_failures == 1
 
 
 @pytest.mark.anyio
