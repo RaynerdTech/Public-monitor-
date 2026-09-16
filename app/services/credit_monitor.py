@@ -234,6 +234,24 @@ async def observe_scrape_creators_balance(
 
     remaining_credits = int(remaining_credits)
     previous = _last_scrape_creators_balance
+
+    # A Render deploy/restart clears all in-memory alert state. Do not send a
+    # low-credit warning from the very first Scrape Creators balance observed
+    # after startup. Treat it as a baseline and require the next normal source
+    # request to confirm a genuinely low balance. This prevents a transient
+    # startup response (for example 42 credits followed by the real 7,000+)
+    # from creating a false Telegram alert after every deploy.
+    if previous is None:
+        burn = scrape_creators_burn_per_hour()
+        _last_scrape_creators_balance = remaining_credits
+        _last_scrape_creators_hours = estimate_hours_remaining(float(remaining_credits), burn)
+        activity(
+            "credit_balance_baseline_initialized",
+            provider="Scrape Creators",
+            remaining_credits=remaining_credits,
+        )
+        return
+
     if _scrape_balance_is_suspicious(previous, remaining_credits):
         suspect = _scrape_creators_suspect_balance
         confirmation_tolerance = max(10, int(max(1, suspect or remaining_credits) * 0.05))

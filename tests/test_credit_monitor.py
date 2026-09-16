@@ -26,3 +26,46 @@ def test_scrape_balance_rejects_one_off_catastrophic_drop():
     assert _scrape_balance_is_suspicious(7063, 7062) is False
     assert _scrape_balance_is_suspicious(100, 24) is True
     assert _scrape_balance_is_suspicious(100, 25) is False
+
+
+def test_scrape_creators_first_observation_is_baseline(monkeypatch):
+    import asyncio
+    import app.services.credit_monitor as cm
+
+    cm._last_scrape_creators_balance = None
+    cm._last_scrape_creators_hours = None
+    cm._scrape_creators_suspect_balance = None
+    cm._alert_states.clear()
+
+    sent = []
+
+    async def fake_send(provider, text):
+        sent.append((provider, text))
+
+    monkeypatch.setattr(cm, "_send_alert", fake_send)
+    asyncio.run(cm.observe_scrape_creators_balance(42, credits_charged=1))
+
+    assert cm._last_scrape_creators_balance == 42
+    assert sent == []
+
+
+def test_scrape_creators_second_low_observation_can_alert(monkeypatch):
+    import asyncio
+    import app.services.credit_monitor as cm
+
+    cm._last_scrape_creators_balance = None
+    cm._last_scrape_creators_hours = None
+    cm._scrape_creators_suspect_balance = None
+    cm._alert_states.clear()
+
+    sent = []
+
+    async def fake_send(provider, text):
+        sent.append((provider, text))
+
+    monkeypatch.setattr(cm, "_send_alert", fake_send)
+    asyncio.run(cm.observe_scrape_creators_balance(42, credits_charged=1))
+    asyncio.run(cm.observe_scrape_creators_balance(41, credits_charged=1))
+
+    assert cm._last_scrape_creators_balance == 41
+    assert len(sent) == 1
