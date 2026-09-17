@@ -155,7 +155,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.7.0"
+APP_VERSION = "10.7.1"
 _threads_persistence_lock = threading.Lock()
 
 
@@ -1301,7 +1301,6 @@ def youtube_test(
         queries = [query] if query else YOUTUBE_QUERIES
         watcher = YouTubeWatcher(
             YOUTUBE_API_KEY,
-    YOUTUBE_DAILY_SEARCH_QUOTA,
             queries,
             interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
             max_results=YOUTUBE_SEARCH_LIMIT,
@@ -1371,7 +1370,6 @@ def youtube_validate_test(
 
         watcher = YouTubeWatcher(
             YOUTUBE_API_KEY,
-    YOUTUBE_DAILY_SEARCH_QUOTA,
             [query],
             interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
             max_results=YOUTUBE_SEARCH_LIMIT,
@@ -1465,7 +1463,6 @@ def watch_youtube(
     async def run() -> None:
         watcher = YouTubeWatcher(
             YOUTUBE_API_KEY,
-    YOUTUBE_DAILY_SEARCH_QUOTA,
             YOUTUBE_QUERIES,
             interval_seconds=interval,
             max_results=YOUTUBE_SEARCH_LIMIT,
@@ -2178,7 +2175,6 @@ def watch_all() -> None:
         if _youtube_configured():
             youtube_watcher = YouTubeWatcher(
                 YOUTUBE_API_KEY,
-    YOUTUBE_DAILY_SEARCH_QUOTA,
                 YOUTUBE_QUERIES,
                 interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
                 max_results=YOUTUBE_SEARCH_LIMIT,
