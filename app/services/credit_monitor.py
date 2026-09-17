@@ -193,9 +193,10 @@ async def _evaluate_balance(
         if not state.exhausted_sent:
             await _send_alert(
                 provider,
-                f"🛑 {provider} credit exhausted\n"
-                f"Remaining: {remaining_display}\n"
-                "Monitoring that depends on this service may stop until it is funded or the key is replaced.",
+                f"🛑 {provider} credit exhausted\n\n"
+                f"Balance: {remaining_display}\n"
+                "Monitoring for this service may stop.\n\n"
+                "Top up or replace the key.",
             )
             state.exhausted_sent = True
         return hours
@@ -207,14 +208,12 @@ async def _evaluate_balance(
     if threshold is None:
         return hours
 
-    burn_daily = burn_per_hour * 24
     await _send_alert(
         provider,
-        f"⚠️ {provider} credit running low\n"
-        f"Remaining: {remaining_display}\n"
-        f"Current estimated use: {burn_daily:.2f} {unit_label}/day\n"
-        f"Estimated time left: {_duration_label(hours)}\n"
-        "Please fund the account or prepare the replacement key before monitoring stops.",
+        f"⚠️ {provider} credit low\n\n"
+        f"Balance: {remaining_display}\n"
+        f"Time left: {_duration_label(hours)}\n\n"
+        "Top up or replace the key before it runs out.",
     )
     # A more urgent warning implicitly supersedes all earlier/less urgent
     # thresholds, so a late-starting monitor never backfills stale warnings.
@@ -493,61 +492,90 @@ async def run_credit_monitor() -> None:
 
 def credit_status_text() -> str:
     usage = snapshot()
-    lines = ["Credit / quota status:"]
 
+    lines = ["💳 Credits & usage"]
+
+    lines.extend(["", "💰 Paid services"] )
     if _last_scrape_creators_balance is None:
-        lines.append("Scrape Creators (Threads + Reddit): waiting for next API response.")
+        lines.extend([
+            "Scrape Creators",
+            "Waiting for balance • Threads + Reddit",
+        ])
     else:
-        lines.append(
-            f"Scrape Creators (Threads + Reddit): {_last_scrape_creators_balance:,} credits left"
-            + (f" ({_duration_label(_last_scrape_creators_hours)} at current rate)" if _last_scrape_creators_hours is not None else "")
+        scrape_time = (
+            f" • {_duration_label(_last_scrape_creators_hours)} left"
+            if _last_scrape_creators_hours is not None
+            else ""
         )
+        lines.extend([
+            "Scrape Creators",
+            f"{_last_scrape_creators_balance:,} credits{scrape_time}",
+            "Threads + Reddit",
+        ])
 
+    lines.append("")
     if _last_apify_remaining_usd is None:
-        lines.append("Apify (Facebook + Instagram): waiting for balance check.")
+        lines.extend([
+            "Apify",
+            "Waiting for balance • Facebook + Instagram",
+        ])
     else:
-        lines.append(
-            f"Apify (Facebook + Instagram): ${_last_apify_remaining_usd:.2f} left before account limit"
-            + (f" ({_duration_label(_last_apify_hours)} at current rate)" if _last_apify_hours is not None else "")
+        apify_time = (
+            f" • {_duration_label(_last_apify_hours)} left"
+            if _last_apify_hours is not None
+            else ""
         )
+        lines.extend([
+            "Apify",
+            f"${_last_apify_remaining_usd:.2f}{apify_time}",
+            "Facebook + Instagram",
+        ])
+
+    lines.extend(["", "📊 Quotas & free services"] )
 
     if _last_x_total_balance_usd is not None:
-        x_line = f"X: ${_last_x_total_balance_usd:.2f} credit balance"
+        x_summary = f"${_last_x_total_balance_usd:.2f} balance"
+    elif _last_x_project_usage is not None:
+        x_summary = "Balance unavailable • API working"
+    elif _last_x_status == "not configured":
+        x_summary = "Not configured"
     else:
-        x_line = f"X: {_last_x_status}"
+        x_summary = "Balance unavailable"
     if _last_x_project_usage is not None and _last_x_project_cap:
-        x_line += f"; {_last_x_project_usage:,}/{_last_x_project_cap:,} monthly Posts used"
-    lines.append(x_line)
+        x_summary += f" • {_last_x_project_usage:,}/{_last_x_project_cap:,} posts used"
+    lines.extend(["X", x_summary])
 
     youtube_search_calls = usage.counts.get("youtube.search_calls", 0)
-    expected_youtube_calls = round((86400 / YOUTUBE_WATCH_INTERVAL_SECONDS) * max(1, len(YOUTUBE_QUERIES)))
-    lines.append(
-        f"YouTube: {youtube_search_calls} search call(s) since restart; configured ~{expected_youtube_calls}/day; "
-        f"quota setting {YOUTUBE_DAILY_SEARCH_QUOTA}/day. Live remaining quota is only available in Google Cloud Console."
-    )
+    lines.extend([
+        "",
+        "YouTube",
+        f"{YOUTUBE_DAILY_SEARCH_QUOTA} searches/day quota • {youtube_search_calls} used since restart",
+    ])
 
     exa_search_calls = usage.counts.get("exa.search_requests", 0)
-    exa_content_calls = usage.counts.get("exa.contents_requests", 0)
     exa_runtime_cost = usage.costs_usd.get("exa.total", 0.0)
-    expected_exa_searches = (86400 / EXA_WATCH_INTERVAL_SECONDS) * max(1, len(EXA_QUERIES))
-    expected_exa_search_cost = expected_exa_searches * EXA_SEARCH_PRICE_USD
-    lines.append(
-        f"Exa web: {exa_search_calls} search + {exa_content_calls} content request(s) since restart; "
-        f"API-reported runtime cost ${exa_runtime_cost:.4f}; configured search cadence ~${expected_exa_search_cost:.2f}/day before fallback content fetches. "
-        "Account balance is not exposed by the documented Search API; check Exa dashboard for the live balance."
-    )
+    lines.extend([
+        "",
+        "Exa web",
+        f"{exa_search_calls} searches since restart • ~${exa_runtime_cost:.3f} used",
+        "Balance: check Exa dashboard",
+    ])
 
     podcast_requests = usage.counts.get("podcast_index.requests", 0)
-    if PODCAST_INDEX_API_KEY:
-        lines.append(
-            f"Podcast Index: {podcast_requests} API request(s) since restart; core index is free and has no credit balance to report."
-        )
-    else:
-        lines.append("Podcast Index: not configured.")
+    lines.extend([
+        "",
+        "Podcast Index",
+        (f"Free • {podcast_requests} requests since restart" if PODCAST_INDEX_API_KEY else "Not configured"),
+    ])
 
-    if WEB_DIRECT_SOURCES:
-        lines.append(f"Direct websites: no paid API credits; {len(WEB_DIRECT_SOURCES)} configured source(s).")
-    else:
-        lines.append("Direct websites: no paid API credits; no sources configured.")
-    lines.append("Telegram Bot API: no credit balance.")
+    lines.extend([
+        "",
+        "Direct websites",
+        f"Free • {len(WEB_DIRECT_SOURCES)} site{'s' if len(WEB_DIRECT_SOURCES) != 1 else ''} monitored",
+        "",
+        "Telegram",
+        "Free",
+    ])
+
     return "\n".join(lines)
+

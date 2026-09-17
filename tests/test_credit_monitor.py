@@ -69,3 +69,36 @@ def test_scrape_creators_second_low_observation_can_alert(monkeypatch):
 
     assert cm._last_scrape_creators_balance == 41
     assert len(sent) == 1
+
+
+def test_low_credit_alert_is_short_and_user_friendly(monkeypatch):
+    import asyncio
+    import app.services.credit_monitor as cm
+
+    sent = []
+
+    async def fake_send(provider, text):
+        sent.append((provider, text))
+
+    monkeypatch.setattr(cm, "_send_alert", fake_send)
+    monkeypatch.setattr(cm, "CREDIT_ALERT_THRESHOLDS_HOURS", [72, 24, 6, 3, 1])
+    cm._alert_states.clear()
+
+    asyncio.run(
+        cm._evaluate_balance(
+            state_key="friendly-test",
+            provider="Apify",
+            remaining=10.0,
+            burn_per_hour=1.0,
+            unit_label="USD",
+            remaining_display="$10.00",
+        )
+    )
+
+    assert len(sent) == 1
+    message = sent[0][1]
+    assert "⚠️ Apify credit low" in message
+    assert "Balance: $10.00" in message
+    assert "Time left:" in message
+    assert "estimated use" not in message.lower()
+    assert "\n\n" in message

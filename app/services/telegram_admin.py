@@ -70,9 +70,10 @@ async def handle_telegram_admin_message(message: dict) -> bool:
         await send_telegram_message(
             TELEGRAM_BOT_TOKEN,
             chat_id,
-            "Apify key: "
-            + masked_apify_token()
-            + ("\nRender rotation: ready" if durable else "\nRender rotation: not configured"),
+            "🔑 Apify status\n\n"
+            f"Key: {masked_apify_token()}\n"
+            + ("Saved to Render: ready\n" if durable else "Saved to Render: not configured\n")
+            + ("Auto-deploy: on" if APIFY_RENDER_AUTO_DEPLOY else "Auto-deploy: off"),
         )
         return True
 
@@ -146,8 +147,10 @@ async def handle_telegram_admin_message(message: dict) -> bool:
         await send_telegram_message(
             TELEGRAM_BOT_TOKEN,
             chat_id,
-            f"✅ Apify key verified for {username} and activated now.\n"
-            "⚠️ Render API credentials are not configured, so the key will be lost on restart.",
+            f"✅ Apify key updated\n\n"
+            f"Account: {username}\n"
+            "Active now\n\n"
+            "⚠️ Not saved to Render. It will be lost after restart.",
         )
         activity("telegram_apify_rotation_completed", destination=chat_id, durable=False, deploy_queued=False)
         return True
@@ -164,8 +167,10 @@ async def handle_telegram_admin_message(message: dict) -> bool:
         await send_telegram_message(
             TELEGRAM_BOT_TOKEN,
             chat_id,
-            f"✅ Apify key verified for {username} and activated now.\n"
-            f"⚠️ Render could not save/deploy it ({type(exc).__name__}).",
+            f"✅ Apify key updated\n\n"
+            f"Account: {username}\n"
+            "Active now\n\n"
+            "⚠️ Could not save it to Render.",
         )
         activity(
             "telegram_apify_rotation_completed",
@@ -180,9 +185,10 @@ async def handle_telegram_admin_message(message: dict) -> bool:
     await send_telegram_message(
         TELEGRAM_BOT_TOKEN,
         chat_id,
-        f"✅ Apify key updated for {username}.\n"
-        "The running monitor switched immediately.\n"
-        + ("Render deploy queued." if APIFY_RENDER_AUTO_DEPLOY else "Saved to Render; auto-deploy is off."),
+        f"✅ Apify key updated\n\n"
+        f"Account: {username}\n"
+        "Active now • saved to Render\n"
+        + ("Auto-deploy: on" if APIFY_RENDER_AUTO_DEPLOY else "Auto-deploy: off"),
     )
     activity(
         "telegram_apify_rotation_completed",

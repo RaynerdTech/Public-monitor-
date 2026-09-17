@@ -32,14 +32,18 @@ def test_credit_status_includes_all_sources(monkeypatch):
     monkeypatch.setattr(cm, "_last_x_project_usage", 100)
     monkeypatch.setattr(cm, "_last_x_project_cap", 1000)
     text = cm.credit_status_text()
-    assert "Scrape Creators (Threads + Reddit)" in text
-    assert "Apify (Facebook + Instagram)" in text
-    assert "X: $12.50" in text
-    assert "YouTube:" in text
-    assert "Exa web:" in text
-    assert "Podcast Index:" in text
-    assert "Direct websites:" in text
-    assert "Telegram Bot API:" in text
+    assert "💳 Credits & usage" in text
+    assert "Scrape Creators" in text
+    assert "Threads + Reddit" in text
+    assert "Apify" in text
+    assert "Facebook + Instagram" in text
+    assert "$12.50 balance" in text
+    assert "YouTube" in text
+    assert "Exa web" in text
+    assert "Podcast Index" in text
+    assert "Direct websites" in text
+    assert "Telegram" in text
+    assert "\n\n" in text
 
 
 def test_x_credit_and_usage_endpoints(monkeypatch):
