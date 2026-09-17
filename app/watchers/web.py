@@ -8,6 +8,7 @@ import httpx
 
 from app.core.activity_log import activity
 from app.core.extractor import extract_referral_links
+from app.services.usage_registry import record_count, record_cost_usd
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -100,6 +101,17 @@ def exa_result_to_source_post(result: dict, page_text: str = "") -> SourcePost |
     )
 
 
+def _record_exa_usage(payload: object, kind: str) -> None:
+    record_count(f"exa.{kind}_requests")
+    if not isinstance(payload, dict):
+        return
+    cost = payload.get("costDollars")
+    if isinstance(cost, dict):
+        record_cost_usd("exa.total", cost.get("total"))
+    elif isinstance(cost, (int, float)):
+        record_cost_usd("exa.total", cost)
+
+
 class ExaWebWatcher(BaseWatcher):
     """Fresh public-web discovery through Exa Search.
 
@@ -152,6 +164,7 @@ class ExaWebWatcher(BaseWatcher):
                 response = await client.post(EXA_SEARCH_URL, json=payload)
                 response.raise_for_status()
                 body = response.json()
+                _record_exa_usage(body, "search")
                 break
             except httpx.HTTPStatusError:
                 # HTTP errors (bad key, credits, bad payload, rate limit, etc.) are
@@ -193,6 +206,7 @@ class ExaWebWatcher(BaseWatcher):
                 response = await client.post(EXA_CONTENTS_URL, json=payload)
                 response.raise_for_status()
                 body = response.json()
+                _record_exa_usage(body, "contents")
                 rows = body.get("results", []) if isinstance(body, dict) else []
                 return (
                     [row for row in rows if isinstance(row, dict)]

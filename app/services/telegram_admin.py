@@ -15,7 +15,7 @@ from app.services.apify import ApifyClient
 from app.services.render_env import persist_render_env_var
 from app.services.runtime_secrets import get_apify_token, masked_apify_token, set_apify_token
 from app.services.telegram import delete_telegram_message, send_telegram_message
-from app.services.credit_monitor import check_apify_credit_once, credit_status_text
+from app.services.credit_monitor import check_apify_credit_once, credit_status_text, refresh_credit_status
 
 
 def parse_apify_token_command(text: object) -> str | None:
@@ -80,7 +80,7 @@ async def handle_telegram_admin_message(message: dict) -> bool:
         if not is_admin_chat(chat_id):
             await send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id, "Not authorized for admin commands.")
             return True
-        await check_apify_credit_once()
+        await refresh_credit_status()
         await send_telegram_message(TELEGRAM_BOT_TOKEN, chat_id, credit_status_text())
         return True
 

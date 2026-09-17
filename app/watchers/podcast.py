@@ -14,6 +14,7 @@ import httpx
 
 from app.core.activity_log import activity
 from app.core.extractor import extract_referral_links
+from app.services.usage_registry import record_count
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -344,6 +345,7 @@ class PodcastWatcher(BaseWatcher):
                 self.api_key, self.api_secret, self.user_agent
             ),
         )
+        record_count("podcast_index.requests")
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}

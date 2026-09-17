@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.core.activity_log import activity
+from app.core.extractor import extract_referral_links, extract_referral_links_from_data
 from app.services.apify import ApifyClient
 from app.services.runtime_secrets import get_apify_token
 from app.watchers.base import BaseWatcher, SourcePost
@@ -55,7 +56,8 @@ def instagram_apify_row_to_source_post(row: dict) -> SourcePost | None:
     if not url and not caption:
         return None
 
-    text = "\n".join(part for part in (caption, hashtag_text) if part)
+    nested_referrals = extract_referral_links_from_data(row)
+    text = "\n".join(part for part in (caption, hashtag_text, *nested_referrals) if part)
     source = f"instagram:search:@{username}" if username else "instagram:search"
     return SourcePost(source=source, text=text, url=url or None, created_at=published)
 
@@ -110,6 +112,9 @@ class ApifyInstagramWatcher(BaseWatcher):
     async def fetch(self) -> list[SourcePost]:
         activity("source_poll_started", source="Instagram")
         posts: list[SourcePost] = []
+        raw_results = 0
+        recent_results = 0
+        referral_results = 0
 
         for query in self.queries:
             rows = await self.client.run_actor(
@@ -118,10 +123,14 @@ class ApifyInstagramWatcher(BaseWatcher):
                 source="Instagram",
                 max_items=self.max_results,
             )
+            raw_results += len(rows)
             for row in rows:
                 post = instagram_apify_row_to_source_post(row)
                 if post is None or not is_recent_timestamp(post.created_at, self.lookback_minutes):
                     continue
+                recent_results += 1
+                if extract_referral_links(post.text):
+                    referral_results += 1
                 key = post.url or f"{post.created_at}:{post.text[:120]}"
                 if key in self._seen:
                     continue
@@ -129,7 +138,7 @@ class ApifyInstagramWatcher(BaseWatcher):
                 posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
-        activity("source_poll_completed", source="Instagram", posts_found=len(posts))
+        activity("source_poll_completed", source="Instagram", raw_results=raw_results, recent_results=recent_results, referral_results=referral_results, posts_found=len(posts))
         return posts
 
     async def stream(self):

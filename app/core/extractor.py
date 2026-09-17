@@ -25,6 +25,30 @@ def extract_referral_links(text: str) -> list[str]:
     return cleaned
 
 
+def extract_referral_links_from_data(value: object) -> list[str]:
+    """Recursively extract referral URLs from structured API/Actor payloads."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def walk(item: object) -> None:
+        if isinstance(item, dict):
+            for nested in item.values():
+                walk(nested)
+            return
+        if isinstance(item, (list, tuple, set)):
+            for nested in item:
+                walk(nested)
+            return
+        if isinstance(item, str):
+            for link in extract_referral_links(item):
+                if link not in seen:
+                    seen.add(link)
+                    found.append(link)
+
+    walk(value)
+    return found
+
+
 def extract_referral_code(url: str) -> str | None:
     parsed = urlparse(url)
 

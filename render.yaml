@@ -10,18 +10,22 @@ services:
         sync: false
       - key: SCRAPE_CREATORS_TIMEOUT_SECONDS
         value: 30
+      - key: REFERRAL_SEARCH_TERM
+        value: claude.ai/referral
+      - key: SEARCH_INCLUDE_BROAD_KEYWORDS
+        value: false
       - key: THREADS_WATCH_INTERVAL_SECONDS
         value: 300
       - key: THREADS_LOOKBACK_MINUTES
         value: 7
       - key: THREADS_QUERIES
-        value: claude referral
+        value: claude.ai/referral
       - key: REDDIT_WATCH_INTERVAL_SECONDS
         value: 300
       - key: REDDIT_LOOKBACK_MINUTES
         value: 7
       - key: REDDIT_QUERIES
-        value: claude referral
+        value: claude.ai/referral
       - key: REDDIT_SCRAPE_FILTER
         value: posts
       - key: REDDIT_SCRAPE_TIMEFRAME
@@ -37,13 +41,13 @@ services:
       - key: APIFY_INSTAGRAM_ACTOR_ID
         value: scraping_solutions~instagram-boolean-search-scraper-posts-reels
       - key: APIFY_RENDER_AUTO_DEPLOY
-        value: true
+        value: false
       - key: INSTAGRAM_WATCH_INTERVAL_SECONDS
-        value: 900
+        value: 300
       - key: INSTAGRAM_LOOKBACK_MINUTES
         value: 17
       - key: INSTAGRAM_QUERIES
-        value: claude referral
+        value: claude.ai/referral
       - key: INSTAGRAM_SEARCH_LIMIT
         value: 10
       - key: INSTAGRAM_CONTENT_TYPE
@@ -53,11 +57,11 @@ services:
       - key: INSTAGRAM_HASHTAG_FEED_TYPE
         value: recent
       - key: FACEBOOK_WATCH_INTERVAL_SECONDS
-        value: 600
+        value: 300
       - key: FACEBOOK_LOOKBACK_MINUTES
         value: 12
       - key: FACEBOOK_QUERIES
-        value: claude referral
+        value: claude.ai/referral
       - key: FACEBOOK_SEARCH_LIMIT
         value: 10
       - key: FACEBOOK_PAGE_DELAY_MS
@@ -90,8 +94,16 @@ services:
         sync: false
       - key: THREADS_RENDER_AUTO_DEPLOY
         value: true
+      - key: YOUTUBE_WATCH_INTERVAL_SECONDS
+        value: 1200
       - key: YOUTUBE_LOOKBACK_MINUTES
         value: 360
+      - key: YOUTUBE_QUERIES
+        value: claude.ai/referral|claude referral|claude guest pass
+      - key: YOUTUBE_DAILY_SEARCH_QUOTA
+        value: 100
+      - key: EXA_SEARCH_PRICE_USD
+        value: 0.007
       - key: WEB_DIRECT_SOURCES
         sync: false
       - key: WEB_DIRECT_WATCH_INTERVAL_SECONDS

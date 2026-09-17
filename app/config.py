@@ -14,6 +14,31 @@ def _env_bool(name: str, default: bool) -> bool:
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
+
+REFERRAL_SEARCH_TERM = (
+    os.getenv("REFERRAL_SEARCH_TERM", "claude.ai/referral").strip()
+    or "claude.ai/referral"
+)
+SEARCH_INCLUDE_BROAD_KEYWORDS = _env_bool("SEARCH_INCLUDE_BROAD_KEYWORDS", False)
+
+
+def _link_focused_queries(env_name: str, broad_default: str) -> list[str]:
+    """Keep paid discovery focused on the referral URL by default.
+
+    Existing keyword ENV values are retained only when SEARCH_INCLUDE_BROAD_KEYWORDS=true.
+    This prevents a legacy `claude referral` setting from hiding posts that contain the
+    actual referral URL, while avoiding extra paid queries by default.
+    """
+    broad = [
+        value.strip()
+        for value in os.getenv(env_name, broad_default).split("||")
+        if value.strip()
+    ]
+    if not SEARCH_INCLUDE_BROAD_KEYWORDS:
+        return [REFERRAL_SEARCH_TERM]
+    values = [REFERRAL_SEARCH_TERM, *broad]
+    return list(dict.fromkeys(values))
+
 SCRAPE_CREATORS_API_KEY = os.getenv("SCRAPE_CREATORS_API_KEY", "").strip()
 SCRAPE_CREATORS_TIMEOUT_SECONDS = max(3.0, float(os.getenv("SCRAPE_CREATORS_TIMEOUT_SECONDS", "30")))
 
@@ -163,14 +188,7 @@ THREADS_WATCH_INTERVAL_SECONDS = max(
 )
 THREADS_LOOKBACK_MINUTES = max(1, int(os.getenv("THREADS_LOOKBACK_MINUTES", "7")))
 THREADS_SEARCH_LIMIT = min(100, max(1, int(os.getenv("THREADS_SEARCH_LIMIT", "50"))))
-THREADS_QUERIES = [
-    query.strip()
-    for query in os.getenv(
-        "THREADS_QUERIES",
-        "claude referral",
-    ).split("||")
-    if query.strip()
-]
+THREADS_QUERIES = _link_focused_queries("THREADS_QUERIES", "claude referral")
 
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
@@ -183,14 +201,7 @@ REDDIT_WATCH_INTERVAL_SECONDS = max(
 )
 REDDIT_LOOKBACK_MINUTES = max(1, int(os.getenv("REDDIT_LOOKBACK_MINUTES", "7")))
 REDDIT_SEARCH_LIMIT = min(100, max(1, int(os.getenv("REDDIT_SEARCH_LIMIT", "100"))))
-REDDIT_QUERIES = [
-    query.strip()
-    for query in os.getenv(
-        "REDDIT_QUERIES",
-        "claude referral",
-    ).split("||")
-    if query.strip()
-]
+REDDIT_QUERIES = _link_focused_queries("REDDIT_QUERIES", "claude referral")
 
 REDDIT_SCRAPE_FILTER = os.getenv("REDDIT_SCRAPE_FILTER", "posts").strip().lower() or "posts"
 REDDIT_SCRAPE_TIMEFRAME = os.getenv("REDDIT_SCRAPE_TIMEFRAME", "day").strip().lower() or "day"
@@ -199,11 +210,7 @@ INSTAGRAM_WATCH_INTERVAL_SECONDS = max(
     60, int(os.getenv("INSTAGRAM_WATCH_INTERVAL_SECONDS", "900"))
 )
 INSTAGRAM_LOOKBACK_MINUTES = max(1, int(os.getenv("INSTAGRAM_LOOKBACK_MINUTES", "17")))
-INSTAGRAM_QUERIES = [
-    value.strip()
-    for value in os.getenv("INSTAGRAM_QUERIES", "claude referral").split("||")
-    if value.strip()
-]
+INSTAGRAM_QUERIES = _link_focused_queries("INSTAGRAM_QUERIES", "claude referral")
 INSTAGRAM_SEARCH_LIMIT = min(100, max(1, int(os.getenv("INSTAGRAM_SEARCH_LIMIT", "10"))))
 INSTAGRAM_CONTENT_TYPE = os.getenv("INSTAGRAM_CONTENT_TYPE", "posts_and_reels").strip() or "posts_and_reels"
 INSTAGRAM_SEARCH_COVERAGE = os.getenv("INSTAGRAM_SEARCH_COVERAGE", "efficient").strip() or "efficient"
@@ -213,11 +220,7 @@ FACEBOOK_WATCH_INTERVAL_SECONDS = max(
     60, int(os.getenv("FACEBOOK_WATCH_INTERVAL_SECONDS", "600"))
 )
 FACEBOOK_LOOKBACK_MINUTES = max(1, int(os.getenv("FACEBOOK_LOOKBACK_MINUTES", "12")))
-FACEBOOK_QUERIES = [
-    value.strip()
-    for value in os.getenv("FACEBOOK_QUERIES", "claude referral").split("||")
-    if value.strip()
-]
+FACEBOOK_QUERIES = _link_focused_queries("FACEBOOK_QUERIES", "claude referral")
 FACEBOOK_SEARCH_LIMIT = min(100, max(1, int(os.getenv("FACEBOOK_SEARCH_LIMIT", "10"))))
 FACEBOOK_PAGE_DELAY_MS = max(0, int(os.getenv("FACEBOOK_PAGE_DELAY_MS", "800")))
 
@@ -227,6 +230,7 @@ YOUTUBE_WATCH_INTERVAL_SECONDS = max(
 )
 YOUTUBE_SEARCH_LIMIT = min(50, max(1, int(os.getenv("YOUTUBE_SEARCH_LIMIT", "50"))))
 YOUTUBE_LOOKBACK_MINUTES = max(5, int(os.getenv("YOUTUBE_LOOKBACK_MINUTES", "360")))
+YOUTUBE_DAILY_SEARCH_QUOTA = max(1, int(os.getenv("YOUTUBE_DAILY_SEARCH_QUOTA", "100")))
 # Keep this as one OR-style query by default. YouTube currently gives search.list
 # its own default bucket of 100 calls/day, so 1200s uses about 72 calls/day and leaves room for tests.
 # Separate extra queries with || only if needed.
@@ -234,7 +238,7 @@ YOUTUBE_QUERIES = [
     query.strip()
     for query in os.getenv(
         "YOUTUBE_QUERIES",
-        "claude referral|claude guest pass|claude.ai/referral",
+        "claude.ai/referral|claude referral|claude guest pass",
     ).split("||")
     if query.strip()
 ]
@@ -250,12 +254,13 @@ EXA_SEARCH_TYPE = os.getenv("EXA_SEARCH_TYPE", "fast").strip() or "fast"
 EXA_PAGE_FETCH_TIMEOUT_SECONDS = max(
     3, int(os.getenv("EXA_PAGE_FETCH_TIMEOUT_SECONDS", "12"))
 )
+EXA_SEARCH_PRICE_USD = max(0.0, float(os.getenv("EXA_SEARCH_PRICE_USD", "0.007")))
 # Keep one broad query by default to control cost. Separate extra queries with ||.
 EXA_QUERIES = [
     query.strip()
     for query in os.getenv(
         "EXA_QUERIES",
-        'recent public webpages containing a Claude referral URL starting with https://claude.ai/referral/ or a Claude Code guest pass',
+        'https://claude.ai/referral/',
     ).split("||")
     if query.strip()
 ]
@@ -327,7 +332,7 @@ PODCAST_DISCOVERY_QUERIES = [
     query.strip()
     for query in os.getenv(
         "PODCAST_DISCOVERY_QUERIES",
-        "Claude||Claude Code",
+        "claude.ai/referral||Claude||Claude Code",
     ).split("||")
     if query.strip()
 ]

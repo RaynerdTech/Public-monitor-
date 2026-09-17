@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import httpx
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -14,8 +15,12 @@ from app.config import (
     CREDIT_MONITOR_INTERVAL_SECONDS,
     FACEBOOK_QUERIES,
     FACEBOOK_WATCH_INTERVAL_SECONDS,
+    EXA_QUERIES,
+    EXA_SEARCH_PRICE_USD,
+    EXA_WATCH_INTERVAL_SECONDS,
     INSTAGRAM_QUERIES,
     INSTAGRAM_WATCH_INTERVAL_SECONDS,
+    PODCAST_INDEX_API_KEY,
     REDDIT_QUERIES,
     REDDIT_WATCH_INTERVAL_SECONDS,
     TELEGRAM_ADMIN_CHAT_IDS,
@@ -23,11 +28,17 @@ from app.config import (
     TELEGRAM_CHAT_IDS,
     THREADS_QUERIES,
     THREADS_WATCH_INTERVAL_SECONDS,
+    WEB_DIRECT_SOURCES,
+    X_BEARER_TOKEN,
+    YOUTUBE_DAILY_SEARCH_QUOTA,
+    YOUTUBE_QUERIES,
+    YOUTUBE_WATCH_INTERVAL_SECONDS,
 )
 from app.core.activity_log import activity
 from app.services.apify import ApifyClient
 from app.services.runtime_secrets import get_apify_token
 from app.services.telegram import send_telegram_message_all
+from app.services.usage_registry import snapshot
 
 
 @dataclass
@@ -54,6 +65,10 @@ _last_scrape_creators_hours: float | None = None
 _scrape_creators_suspect_balance: int | None = None
 _last_apify_remaining_usd: float | None = None
 _last_apify_hours: float | None = None
+_last_x_total_balance_usd: float | None = None
+_last_x_project_usage: int | None = None
+_last_x_project_cap: int | None = None
+_last_x_status: str = "not checked"
 
 
 def _alert_destinations() -> list[str]:
@@ -401,6 +416,70 @@ async def check_apify_credit_once() -> tuple[float | None, float | None]:
         return None, None
 
 
+async def check_x_credit_once() -> tuple[float | None, int | None, int | None]:
+    """Fetch X credit balance and monthly Post usage when the account exposes them."""
+    global _last_x_total_balance_usd, _last_x_project_usage, _last_x_project_cap, _last_x_status
+    if not X_BEARER_TOKEN:
+        _last_x_status = "not configured"
+        return None, None, None
+
+    headers = {"Authorization": f"Bearer {X_BEARER_TOKEN}", "Accept": "application/json"}
+    balance = None
+    project_usage = None
+    project_cap = None
+    statuses: list[str] = []
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True, headers=headers) as client:
+        try:
+            response = await client.get("https://api.x.com/2/usage/credits")
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                raw = data.get("total_balance")
+                if raw is not None:
+                    balance = float(raw)
+                    _last_x_total_balance_usd = balance
+            statuses.append("credit balance ok")
+        except Exception as exc:
+            statuses.append(f"credit balance unavailable ({type(exc).__name__})")
+
+        try:
+            response = await client.get(
+                "https://api.x.com/2/usage/tweets",
+                params={"days": 30, "usage.fields": "project_cap,project_usage"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                if data.get("project_usage") is not None:
+                    project_usage = int(data.get("project_usage"))
+                    _last_x_project_usage = project_usage
+                if data.get("project_cap") is not None:
+                    project_cap = int(data.get("project_cap"))
+                    _last_x_project_cap = project_cap
+            statuses.append("usage ok")
+        except Exception as exc:
+            statuses.append(f"usage unavailable ({type(exc).__name__})")
+
+    _last_x_status = "; ".join(statuses)
+    activity(
+        "credit_monitor_checked",
+        provider="X",
+        total_balance_usd=balance,
+        project_usage=project_usage,
+        project_cap=project_cap,
+    )
+    return balance, project_usage, project_cap
+
+
+async def refresh_credit_status() -> None:
+    await asyncio.gather(
+        check_apify_credit_once(),
+        check_x_credit_once(),
+    )
+
+
 async def run_credit_monitor() -> None:
     activity(
         "credit_monitor_started",
@@ -413,19 +492,62 @@ async def run_credit_monitor() -> None:
 
 
 def credit_status_text() -> str:
-    lines = ["Credit status:"]
+    usage = snapshot()
+    lines = ["Credit / quota status:"]
+
     if _last_scrape_creators_balance is None:
-        lines.append("Scrape Creators: waiting for the next Threads/Reddit request.")
+        lines.append("Scrape Creators (Threads + Reddit): waiting for next API response.")
     else:
         lines.append(
-            f"Scrape Creators: {_last_scrape_creators_balance:,} credits left"
+            f"Scrape Creators (Threads + Reddit): {_last_scrape_creators_balance:,} credits left"
             + (f" ({_duration_label(_last_scrape_creators_hours)} at current rate)" if _last_scrape_creators_hours is not None else "")
         )
+
     if _last_apify_remaining_usd is None:
-        lines.append("Apify: waiting for the next balance check.")
+        lines.append("Apify (Facebook + Instagram): waiting for balance check.")
     else:
         lines.append(
-            f"Apify: ${_last_apify_remaining_usd:.2f} left before the account limit"
+            f"Apify (Facebook + Instagram): ${_last_apify_remaining_usd:.2f} left before account limit"
             + (f" ({_duration_label(_last_apify_hours)} at current rate)" if _last_apify_hours is not None else "")
         )
+
+    if _last_x_total_balance_usd is not None:
+        x_line = f"X: ${_last_x_total_balance_usd:.2f} credit balance"
+    else:
+        x_line = f"X: {_last_x_status}"
+    if _last_x_project_usage is not None and _last_x_project_cap:
+        x_line += f"; {_last_x_project_usage:,}/{_last_x_project_cap:,} monthly Posts used"
+    lines.append(x_line)
+
+    youtube_search_calls = usage.counts.get("youtube.search_calls", 0)
+    expected_youtube_calls = round((86400 / YOUTUBE_WATCH_INTERVAL_SECONDS) * max(1, len(YOUTUBE_QUERIES)))
+    lines.append(
+        f"YouTube: {youtube_search_calls} search call(s) since restart; configured ~{expected_youtube_calls}/day; "
+        f"quota setting {YOUTUBE_DAILY_SEARCH_QUOTA}/day. Live remaining quota is only available in Google Cloud Console."
+    )
+
+    exa_search_calls = usage.counts.get("exa.search_requests", 0)
+    exa_content_calls = usage.counts.get("exa.contents_requests", 0)
+    exa_runtime_cost = usage.costs_usd.get("exa.total", 0.0)
+    expected_exa_searches = (86400 / EXA_WATCH_INTERVAL_SECONDS) * max(1, len(EXA_QUERIES))
+    expected_exa_search_cost = expected_exa_searches * EXA_SEARCH_PRICE_USD
+    lines.append(
+        f"Exa web: {exa_search_calls} search + {exa_content_calls} content request(s) since restart; "
+        f"API-reported runtime cost ${exa_runtime_cost:.4f}; configured search cadence ~${expected_exa_search_cost:.2f}/day before fallback content fetches. "
+        "Account balance is not exposed by the documented Search API; check Exa dashboard for the live balance."
+    )
+
+    podcast_requests = usage.counts.get("podcast_index.requests", 0)
+    if PODCAST_INDEX_API_KEY:
+        lines.append(
+            f"Podcast Index: {podcast_requests} API request(s) since restart; core index is free and has no credit balance to report."
+        )
+    else:
+        lines.append("Podcast Index: not configured.")
+
+    if WEB_DIRECT_SOURCES:
+        lines.append(f"Direct websites: no paid API credits; {len(WEB_DIRECT_SOURCES)} configured source(s).")
+    else:
+        lines.append("Direct websites: no paid API credits; no sources configured.")
+    lines.append("Telegram Bot API: no credit balance.")
     return "\n".join(lines)

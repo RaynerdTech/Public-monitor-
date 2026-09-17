@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import httpx
 
 from app.core.activity_log import activity
+from app.core.extractor import extract_referral_links, extract_referral_links_from_data
 from app.services.scrape_creators import ScrapeCreatorsClient
 from app.watchers.base import BaseWatcher, SourcePost
 from app.watchers.freshness import is_recent_timestamp
@@ -88,9 +89,14 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
     async def fetch(self) -> list[SourcePost]:
         activity("source_poll_started", source="Reddit")
         posts: list[SourcePost] = []
+        raw_results = 0
+        recent_results = 0
+        referral_results = 0
 
         for query in self.queries:
-            for row in await self._search(query):
+            rows = await self._search(query)
+            raw_results += len(rows)
+            for row in rows:
                 if not isinstance(row, dict):
                     continue
                 row_id = str(row.get("id") or row.get("name") or row.get("post_id") or "").strip()
@@ -101,13 +107,20 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
                     post = self._comment_to_source_post(row)
                 else:
                     post = reddit_row_to_source_post(row)
+                if post is not None:
+                    nested_referrals = extract_referral_links_from_data(row)
+                    if nested_referrals:
+                        post.text = "\n".join(part for part in [post.text, *nested_referrals] if part)
                 if post is not None and is_recent_timestamp(
                     post.created_at, self.lookback_minutes
                 ):
+                    recent_results += 1
+                    if extract_referral_links(post.text):
+                        referral_results += 1
                     posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
-        activity("source_poll_completed", source="Reddit", posts_found=len(posts))
+        activity("source_poll_completed", source="Reddit", raw_results=raw_results, recent_results=recent_results, referral_results=referral_results, posts_found=len(posts))
         return posts
 
     async def stream(self):

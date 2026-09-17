@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.core.activity_log import activity
+from app.core.extractor import extract_referral_links
 from app.services.scrape_creators import ScrapeCreatorsClient
 from app.watchers.base import BaseWatcher, SourcePost
 from app.watchers.freshness import is_recent_timestamp
@@ -148,9 +149,14 @@ class ScrapeCreatorsThreadsWatcher(BaseWatcher):
     async def fetch(self) -> list[SourcePost]:
         activity("source_poll_started", source="Threads")
         posts: list[SourcePost] = []
+        raw_results = 0
+        recent_results = 0
+        referral_results = 0
 
         for query in self.queries:
-            for row in await self._search(query):
+            rows = await self._search(query)
+            raw_results += len(rows)
+            for row in rows:
                 if not isinstance(row, dict):
                     continue
                 post_id = str(row.get("id") or row.get("pk") or row.get("code") or "").strip()
@@ -161,10 +167,13 @@ class ScrapeCreatorsThreadsWatcher(BaseWatcher):
                 if post is not None and is_recent_timestamp(
                     post.created_at, self.lookback_minutes
                 ):
+                    recent_results += 1
+                    if extract_referral_links(post.text):
+                        referral_results += 1
                     posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
-        activity("source_poll_completed", source="Threads", posts_found=len(posts))
+        activity("source_poll_completed", source="Threads", raw_results=raw_results, recent_results=recent_results, referral_results=referral_results, posts_found=len(posts))
         return posts
 
     async def stream(self):

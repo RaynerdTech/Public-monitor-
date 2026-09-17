@@ -7,6 +7,7 @@ import httpx
 
 from app.core.activity_log import activity
 from app.core.extractor import extract_referral_links
+from app.services.usage_registry import record_count
 from app.watchers.base import BaseWatcher, SourcePost
 
 
@@ -149,6 +150,7 @@ class YouTubeWatcher(BaseWatcher):
             "key": self.api_key,
         }
         response = await client.get(YOUTUBE_SEARCH_URL, params=params)
+        record_count("youtube.search_calls")
         response.raise_for_status()
         payload = response.json()
 
@@ -173,6 +175,7 @@ class YouTubeWatcher(BaseWatcher):
             "key": self.api_key,
         }
         response = await client.get(YOUTUBE_VIDEOS_URL, params=params)
+        record_count("youtube.video_detail_calls")
         response.raise_for_status()
         payload = response.json()
         return [item for item in (payload.get("items") or []) if isinstance(item, dict)]
@@ -198,6 +201,7 @@ class YouTubeWatcher(BaseWatcher):
                 details.extend(await self._video_details(client, candidate_ids[offset : offset + 50]))
 
         posts: list[SourcePost] = []
+        referral_matches = 0
         for video in details:
             video_id = str(video.get("id") or "").strip()
             if not video_id or video_id in self._seen_video_ids:
@@ -207,6 +211,7 @@ class YouTubeWatcher(BaseWatcher):
                 # Do not permanently mark the video as seen. Its description may
                 # be edited later, and the rolling window should inspect it again.
                 continue
+            referral_matches += 1
             self._seen_video_ids.add(video_id)
             posts.append(post)
 
@@ -215,6 +220,8 @@ class YouTubeWatcher(BaseWatcher):
             "source_poll_completed",
             source="YouTube",
             candidates=len(candidate_ids),
+            details_checked=len(details),
+            referral_matches=referral_matches,
             posts_found=len(posts),
         )
         return posts

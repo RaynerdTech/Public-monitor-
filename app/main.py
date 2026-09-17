@@ -12,6 +12,8 @@ from rich.console import Console
 from rich.table import Table
 
 from app.config import (
+    REFERRAL_SEARCH_TERM,
+    SEARCH_INCLUDE_BROAD_KEYWORDS,
     EXA_WATCH_INTERVAL_SECONDS,
     EXA_SEARCH_TYPE,
     EXA_SEARCH_LIMIT,
@@ -94,6 +96,7 @@ from app.config import (
     VALIDATOR_BROWSER_HEADLESS,
     VALIDATOR_BROWSER_CHANNEL,
     YOUTUBE_API_KEY,
+    YOUTUBE_DAILY_SEARCH_QUOTA,
     YOUTUBE_LOOKBACK_MINUTES,
     YOUTUBE_QUERIES,
     YOUTUBE_SEARCH_LIMIT,
@@ -152,7 +155,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.6.0"
+APP_VERSION = "10.7.0"
 _threads_persistence_lock = threading.Lock()
 
 
@@ -1298,6 +1301,7 @@ def youtube_test(
         queries = [query] if query else YOUTUBE_QUERIES
         watcher = YouTubeWatcher(
             YOUTUBE_API_KEY,
+    YOUTUBE_DAILY_SEARCH_QUOTA,
             queries,
             interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
             max_results=YOUTUBE_SEARCH_LIMIT,
@@ -1367,6 +1371,7 @@ def youtube_validate_test(
 
         watcher = YouTubeWatcher(
             YOUTUBE_API_KEY,
+    YOUTUBE_DAILY_SEARCH_QUOTA,
             [query],
             interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
             max_results=YOUTUBE_SEARCH_LIMIT,
@@ -1460,6 +1465,7 @@ def watch_youtube(
     async def run() -> None:
         watcher = YouTubeWatcher(
             YOUTUBE_API_KEY,
+    YOUTUBE_DAILY_SEARCH_QUOTA,
             YOUTUBE_QUERIES,
             interval_seconds=interval,
             max_results=YOUTUBE_SEARCH_LIMIT,
@@ -1524,17 +1530,6 @@ def web_test(
         queries = [query] if query else EXA_QUERIES
         watcher = ExaWebWatcher(
             EXA_API_KEY,
-    PODCAST_DISCOVERY_INTERVAL_SECONDS,
-    PODCAST_DISCOVERY_QUERIES,
-    PODCAST_INDEX_API_KEY,
-    PODCAST_INDEX_API_SECRET,
-    PODCAST_INDEX_RECENT_MAX,
-    PODCAST_INDEX_USER_AGENT,
-    PODCAST_INDEX_WATCH_INTERVAL_SECONDS,
-    PODCAST_LOOKBACK_MINUTES,
-    PODCAST_RSS_INTERVAL_SECONDS,
-    PODCAST_RSS_MAX_FEEDS,
-    PODCAST_SOURCE_REGISTRY,
             queries,
             interval_seconds=EXA_WATCH_INTERVAL_SECONDS,
             max_results=EXA_SEARCH_LIMIT,
@@ -2183,6 +2178,7 @@ def watch_all() -> None:
         if _youtube_configured():
             youtube_watcher = YouTubeWatcher(
                 YOUTUBE_API_KEY,
+    YOUTUBE_DAILY_SEARCH_QUOTA,
                 YOUTUBE_QUERIES,
                 interval_seconds=YOUTUBE_WATCH_INTERVAL_SECONDS,
                 max_results=YOUTUBE_SEARCH_LIMIT,
@@ -2531,6 +2527,8 @@ def status() -> None:
         )
 
     table.add_row("Scrape Creators API", "yes" if SCRAPE_CREATORS_API_KEY else "no")
+    table.add_row("Referral search target", REFERRAL_SEARCH_TERM)
+    table.add_row("Broad keyword extras", "yes" if SEARCH_INCLUDE_BROAD_KEYWORDS else "no")
     scrape_requests_threads = _monthly_scrape_creator_requests(
         THREADS_WATCH_INTERVAL_SECONDS, len(THREADS_QUERIES)
     )
@@ -2600,6 +2598,7 @@ def status() -> None:
     table.add_row("YouTube", "yes" if _youtube_configured() else "no")
     table.add_row("YouTube interval", f"{YOUTUBE_WATCH_INTERVAL_SECONDS}s")
     table.add_row("YouTube queries", " | ".join(YOUTUBE_QUERIES) or "-")
+    table.add_row("YouTube search quota setting", f"{YOUTUBE_DAILY_SEARCH_QUOTA}/day")
     table.add_row("Web / Exa", "yes" if _web_configured() else "no")
     table.add_row("Web interval", f"{EXA_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Web search type", EXA_SEARCH_TYPE)
