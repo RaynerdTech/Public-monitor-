@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -33,6 +33,32 @@ def _host_min_interval_seconds() -> float:
     except ValueError:
         return 2.1
     return max(0.0, value)
+
+
+_REDDIT_HOST_SUFFIX = "reddit.com"
+
+
+def _authenticate_reddit_url(url: str) -> str:
+    """Attach the account's private RSS token to Reddit feed requests.
+
+    Render's outbound address is a shared datacenter IP, so Reddit's anonymous
+    per-IP budget is largely spent by other tenants and even one request every
+    two seconds drew 429. The feed/user pair from old.reddit.com/prefs/feeds
+    bills the request to the account instead. Supplied via environment so the
+    token never enters the repository.
+    """
+    token = os.getenv("REDDIT_FEED_TOKEN", "").strip()
+    user = os.getenv("REDDIT_FEED_USER", "").strip()
+    if not token or not user:
+        return url
+    parts = urlparse(url)
+    host = (parts.hostname or "").lower()
+    if host != _REDDIT_HOST_SUFFIX and not host.endswith("." + _REDDIT_HOST_SUFFIX):
+        return url
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.setdefault("feed", token)
+    query.setdefault("user", user)
+    return urlunparse(parts._replace(query=urlencode(query)))
 
 
 class _HostPacer:
@@ -222,7 +248,8 @@ class DirectWebsiteWatcher(BaseWatcher):
     ) -> httpx.Response:
         await self._pacer.wait(url)
         return await client.get(
-            url, headers=self._conditional_headers(url, conditional=conditional)
+            _authenticate_reddit_url(url),
+            headers=self._conditional_headers(url, conditional=conditional),
         )
 
     @staticmethod
