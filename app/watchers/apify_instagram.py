@@ -116,6 +116,10 @@ class ApifyInstagramWatcher(BaseWatcher):
             "contentType": self.content_type,
             "searchCoverage": self.search_coverage,
             "hashtagFeedType": self.hashtag_feed_type,
+            # Make the intended Boolean semantics explicit. The Actor can
+            # normalize implicit AND, but explicit syntax is easier to audit
+            # and prevents a malformed query from silently becoming broad.
+            "strictBooleanSyntax": True,
             "oldestPostDate": cutoff.date().isoformat(),
             "newestPostDate": today,
         }

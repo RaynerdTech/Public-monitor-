@@ -80,8 +80,8 @@ APIFY_API_TOKEN = os.getenv("APIFY_API_TOKEN", "").strip()
 APIFY_TIMEOUT_SECONDS = max(30.0, float(os.getenv("APIFY_TIMEOUT_SECONDS", "150")))
 APIFY_MAX_RUN_COST_USD = max(0.01, float(os.getenv("APIFY_MAX_RUN_COST_USD", "0.10")))
 APIFY_FACEBOOK_ACTOR_ID = (
-    os.getenv("APIFY_FACEBOOK_ACTOR_ID", "memo23~facebook-search-scraper").strip()
-    or "memo23~facebook-search-scraper"
+    os.getenv("APIFY_FACEBOOK_ACTOR_ID", "silentflow~facebook-search-scraper").strip()
+    or "silentflow~facebook-search-scraper"
 )
 APIFY_INSTAGRAM_ACTOR_ID = (
     os.getenv(
@@ -254,7 +254,7 @@ INSTAGRAM_LOOKBACK_MINUTES = max(1, int(os.getenv("INSTAGRAM_LOOKBACK_MINUTES", 
 INSTAGRAM_MAX_POST_AGE_MINUTES = _max_post_age_minutes("INSTAGRAM_MAX_POST_AGE_MINUTES", 360)
 # The boolean-search Actor matches on whole words and discourages punctuation.
 INSTAGRAM_QUERIES = _link_focused_queries(
-    "INSTAGRAM_QUERIES", "claude referral", engine_matches_urls=False
+    "INSTAGRAM_QUERIES", "claude AND referral", engine_matches_urls=False
 )
 INSTAGRAM_SEARCH_LIMIT = min(100, max(1, int(os.getenv("INSTAGRAM_SEARCH_LIMIT", "10"))))
 INSTAGRAM_CONTENT_TYPE = os.getenv("INSTAGRAM_CONTENT_TYPE", "posts_and_reels").strip() or "posts_and_reels"

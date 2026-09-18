@@ -170,11 +170,25 @@ class ApifyFacebookWatcher(BaseWatcher):
         self._seen: set[str] = set()
 
     def build_input(self, query: str) -> dict:
-        # Input schema of memo23~facebook-search-scraper is exactly:
-        # searchType, searchQueries, maxItems, pageDelayMs, proxy.
-        # It has NO date filter. The previously sent "onlyPostsNewerThan" key
-        # belongs to a different Actor and was silently ignored, so date
-        # filtering has to happen locally after the run.
+        normalized = self.actor_id.replace("/", "~").strip("~")
+
+        # SilentFlow exposes exactly what this monitor needs: native Facebook
+        # recent-post sorting plus a date range. Keep the date window broader
+        # than the minute-level max-age gate so timezone/day boundaries cannot
+        # hide a fresh post; final freshness is still enforced locally.
+        if normalized == "silentflow~facebook-search-scraper":
+            now = datetime.now(timezone.utc)
+            return {
+                "query": query,
+                "search_type": "posts",
+                "max_posts": self.max_results,
+                "recent_posts": True,
+                "start_date": (now - timedelta(days=1)).date().isoformat(),
+                "end_date": (now + timedelta(days=1)).date().isoformat(),
+            }
+
+        # Backwards compatibility for deployments that deliberately keep the
+        # older memo23 Actor. It has no native recency/date controls.
         return {
             "searchType": "posts",
             "searchQueries": [query],
