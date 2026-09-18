@@ -198,11 +198,25 @@ class DirectWebsiteWatcher(BaseWatcher):
                 self._remember_validators(url, response)
             return response
         except httpx.HTTPError as exc:
+            status_code: int | None = None
+            body_snippet: str | None = None
+            retry_after: str | None = None
+            response = getattr(exc, "response", None)
+            if response is not None:
+                status_code = response.status_code
+                retry_after = response.headers.get("retry-after")
+                try:
+                    body_snippet = " ".join(response.text.split())[:300]
+                except (UnicodeDecodeError, httpx.ResponseNotRead):
+                    body_snippet = None
             activity(
                 "web_direct_fetch_failed",
                 source="Web / Direct",
                 target_url=url,
                 error_type=type(exc).__name__,
+                status_code=status_code,
+                retry_after=retry_after,
+                body_snippet=body_snippet,
                 level="WARNING",
             )
             return None
