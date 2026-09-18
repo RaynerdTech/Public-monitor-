@@ -1,5 +1,6 @@
 import asyncio
 import html
+import os
 import re
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
@@ -16,6 +17,47 @@ from app.watchers.base import BaseWatcher, SourcePost
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+
+
+def _host_min_interval_seconds() -> float:
+    """Minimum gap between two requests to the same host.
+
+    Reddit's feed endpoints answer 429 when an IP asks again inside roughly two
+    seconds (its own headers report x-ratelimit-remaining: 0.0 with reset: 2).
+    The watcher previously fired every endpoint through one Semaphore(8), so
+    three subreddit feeds left within the same millisecond and all three were
+    refused. Requests to different hosts still run in parallel.
+    """
+    try:
+        value = float(os.getenv("WEB_DIRECT_HOST_MIN_INTERVAL_SECONDS", "2.1"))
+    except ValueError:
+        return 2.1
+    return max(0.0, value)
+
+
+class _HostPacer:
+    """Serialize requests per host and keep a minimum gap between them."""
+
+    def __init__(self, min_interval: float) -> None:
+        self._min_interval = min_interval
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._next_allowed: dict[str, float] = {}
+
+    async def wait(self, url: str) -> None:
+        if self._min_interval <= 0:
+            return
+        host = (urlparse(url).hostname or "").lower()
+        if not host:
+            return
+        lock = self._locks.setdefault(host, asyncio.Lock())
+        async with lock:
+            loop = asyncio.get_running_loop()
+            now = loop.time()
+            earliest = self._next_allowed.get(host, 0.0)
+            if now < earliest:
+                await asyncio.sleep(earliest - now)
+                now = loop.time()
+            self._next_allowed[host] = now + self._min_interval
 
 
 def _local_name(tag: str) -> str:
@@ -151,6 +193,7 @@ class DirectWebsiteWatcher(BaseWatcher):
         self._bootstrapped = False
         self._seen_undated_pages: set[str] = set()
         self._seen_referrals_by_url: dict[str, frozenset[str]] = {}
+        self._pacer = _HostPacer(_host_min_interval_seconds())
 
     def _conditional_headers(self, url: str, *, conditional: bool = True) -> dict[str, str]:
         headers = {
@@ -170,6 +213,27 @@ class DirectWebsiteWatcher(BaseWatcher):
         if values:
             self._validators[url] = values
 
+    async def _paced_get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        conditional: bool,
+    ) -> httpx.Response:
+        await self._pacer.wait(url)
+        return await client.get(
+            url, headers=self._conditional_headers(url, conditional=conditional)
+        )
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response) -> float:
+        raw = (response.headers.get("retry-after") or "").strip()
+        try:
+            seconds = float(raw)
+        except ValueError:
+            seconds = 0.0
+        return min(30.0, max(2.5, seconds))
+
     async def _get(
         self,
         client: httpx.AsyncClient,
@@ -188,9 +252,18 @@ class DirectWebsiteWatcher(BaseWatcher):
         bandwidth.
         """
         try:
-            response = await client.get(
-                url, headers=self._conditional_headers(url, conditional=conditional)
-            )
+            response = await self._paced_get(client, url, conditional=conditional)
+            if response.status_code == 429:
+                delay = self._retry_after_seconds(response)
+                activity(
+                    "web_direct_rate_limited",
+                    source="Web / Direct",
+                    target_url=url,
+                    retry_after_seconds=round(delay, 2),
+                    level="INFO",
+                )
+                await asyncio.sleep(delay)
+                response = await self._paced_get(client, url, conditional=conditional)
             if response.status_code == 304:
                 return response
             response.raise_for_status()
