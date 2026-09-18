@@ -5,11 +5,11 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from app.config import SOURCE_DIAGNOSTIC_SAMPLES
 from app.core.activity_log import activity
-from app.core.extractor import extract_referral_links
 from app.services.scrape_creators import ScrapeCreatorsClient
 from app.watchers.base import BaseWatcher, SourcePost
-from app.watchers.freshness import is_recent_timestamp
+from app.watchers.candidates import PollDiagnostics, evaluate_candidate
 
 
 THREADS_SEARCH_PATH = "/v1/threads/search"
@@ -120,6 +120,7 @@ class ScrapeCreatorsThreadsWatcher(BaseWatcher):
         *,
         interval_seconds: int = 300,
         lookback_minutes: int = 7,
+        max_post_age_minutes: int = 180,
         timeout_seconds: float = 30.0,
     ) -> None:
         self.queries = [query.strip() for query in queries if query.strip()]
@@ -127,53 +128,78 @@ class ScrapeCreatorsThreadsWatcher(BaseWatcher):
             raise ValueError("At least one Threads search query is required")
         self.interval_seconds = max(30, int(interval_seconds))
         self.lookback_minutes = max(1, int(lookback_minutes))
+        self.max_post_age_minutes = max(1, int(max_post_age_minutes))
         self.client = ScrapeCreatorsClient(api_key, timeout_seconds=timeout_seconds)
         self._seen_post_ids: set[str] = set()
 
     async def _search(self, query: str) -> list[dict]:
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(minutes=self.lookback_minutes)
+        # start_date/end_date are calendar dates, not timestamps. Reach back a
+        # full day so a post is never missed because the provider's day boundary
+        # differs from ours; minute-level filtering happens locally afterwards.
+        start = (now - timedelta(minutes=self.lookback_minutes, days=1)).date()
+        end = (now + timedelta(days=1)).date()
         result = await self.client.get(
             THREADS_SEARCH_PATH,
             params={
                 "query": query,
-                "start_date": cutoff.date().isoformat(),
-                "end_date": now.date().isoformat(),
-                "trim": False,
+                "start_date": start.isoformat(),
+                "end_date": end.isoformat(),
+                "trim": "false",
             },
             source="Threads",
         )
-        rows = result.payload.get("posts", [])
-        return rows if isinstance(rows, list) else []
+        rows = result.payload.get("posts")
+        if isinstance(rows, list):
+            return rows
+        # Surface an unexpected envelope instead of silently reporting zero.
+        activity(
+            "provider_payload_unexpected",
+            source="Threads",
+            expected_key="posts",
+            payload_keys=sorted(result.payload.keys())[:20],
+            level="WARNING",
+        )
+        return []
 
     async def fetch(self) -> list[SourcePost]:
-        activity("source_poll_started", source="Threads")
+        activity(
+            "source_poll_started",
+            source="Threads",
+            queries=self.queries,
+            lookback_minutes=self.lookback_minutes,
+            max_post_age_minutes=self.max_post_age_minutes,
+        )
         posts: list[SourcePost] = []
-        raw_results = 0
-        recent_results = 0
-        referral_results = 0
+        diagnostics = PollDiagnostics("Threads", sample_limit=SOURCE_DIAGNOSTIC_SAMPLES)
 
         for query in self.queries:
             rows = await self._search(query)
-            raw_results += len(rows)
+            diagnostics.record_raw(len(rows))
             for row in rows:
                 if not isinstance(row, dict):
+                    diagnostics.record(
+                        evaluate_candidate(None, max_post_age_minutes=self.max_post_age_minutes),
+                        None,
+                    )
                     continue
                 post_id = str(row.get("id") or row.get("pk") or row.get("code") or "").strip()
-                if not post_id or post_id in self._seen_post_ids:
+                if post_id and post_id in self._seen_post_ids:
+                    diagnostics.record_duplicate(post_id)
                     continue
-                self._seen_post_ids.add(post_id)
+                if post_id:
+                    self._seen_post_ids.add(post_id)
                 post = threads_row_to_source_post(row)
-                if post is not None and is_recent_timestamp(
-                    post.created_at, self.lookback_minutes
-                ):
-                    recent_results += 1
-                    if extract_referral_links(post.text):
-                        referral_results += 1
+                verdict = evaluate_candidate(
+                    post,
+                    max_post_age_minutes=self.max_post_age_minutes,
+                    lookback_minutes=self.lookback_minutes,
+                )
+                if diagnostics.record(verdict, post, row_id=post_id) and post is not None:
                     posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
-        activity("source_poll_completed", source="Threads", raw_results=raw_results, recent_results=recent_results, referral_results=referral_results, posts_found=len(posts))
+        diagnostics.completed(posts_found=len(posts))
         return posts
 
     async def stream(self):

@@ -154,8 +154,21 @@ class YouTubeWatcher(BaseWatcher):
         response.raise_for_status()
         payload = response.json()
 
+        items = payload.get("items") or []
+        total = payload.get("pageInfo", {}).get("totalResults") if isinstance(
+            payload.get("pageInfo"), dict
+        ) else None
+        activity(
+            "youtube_search_completed",
+            source="YouTube",
+            query=query,
+            published_after=params["publishedAfter"],
+            items_returned=len(items) if isinstance(items, list) else 0,
+            total_results=total,
+        )
+
         ids: list[str] = []
-        for item in payload.get("items") or []:
+        for item in items:
             if not isinstance(item, dict):
                 continue
             identifier = item.get("id") or {}
@@ -185,7 +198,12 @@ class YouTubeWatcher(BaseWatcher):
             activity("source_poll_skipped", source="YouTube", reason="not_configured")
             return []
 
-        activity("source_poll_started", source="YouTube")
+        activity(
+            "source_poll_started",
+            source="YouTube",
+            queries=self.queries,
+            lookback_minutes=self.lookback_minutes,
+        )
         now = datetime.now(timezone.utc)
         published_after = self._published_after(now)
         candidate_ids: list[str] = []
@@ -222,6 +240,7 @@ class YouTubeWatcher(BaseWatcher):
             candidates=len(candidate_ids),
             details_checked=len(details),
             referral_matches=referral_matches,
+            already_seen=len(self._seen_video_ids),
             posts_found=len(posts),
         )
         return posts

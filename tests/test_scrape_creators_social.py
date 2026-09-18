@@ -270,40 +270,46 @@ def test_facebook_source_parser_and_watcher(monkeypatch):
     asyncio.run(run())
 
 
-def test_social_watchers_drop_stale_results(monkeypatch):
-    stale_ts = int((datetime.now(timezone.utc) - timedelta(hours=2)).timestamp())
+def _thread_row(post_id, taken_at, code="CODE"):
+    return {
+        "id": post_id,
+        "user": {"username": "someone"},
+        "caption": {"text": f"https://claude.ai/referral/{code}"},
+        "code": code,
+        "taken_at": int(taken_at.timestamp()),
+    }
 
-    threads = ScrapeCreatorsThreadsWatcher("key", ["claude referral"], lookback_minutes=7)
+
+def _reddit_row(row_id, created, code="CODE"):
+    return {
+        "id": row_id,
+        "subreddit": "ClaudeAI",
+        "author": "someone",
+        "created_utc": int(created.timestamp()),
+        "permalink": f"/r/ClaudeAI/comments/{row_id}/post/",
+        "title": "Claude",
+        "selftext": f"https://claude.ai/referral/{code}",
+    }
+
+
+def test_social_watchers_drop_results_past_the_max_post_age(monkeypatch):
+    stale = datetime.now(timezone.utc) - timedelta(hours=9)
+
+    threads = ScrapeCreatorsThreadsWatcher(
+        "key", ["claude referral"], lookback_minutes=7, max_post_age_minutes=180
+    )
 
     async def fake_threads_get(path, *, params=None, source):
-        return _response({
-            "posts": [{
-                "id": "stale-thread",
-                "user": {"username": "old"},
-                "caption": {"text": "https://claude.ai/referral/old"},
-                "code": "OLD",
-                "taken_at": stale_ts,
-            }]
-        })
+        return _response({"posts": [_thread_row("stale-thread", stale, "old")]})
 
     monkeypatch.setattr(threads.client, "get", fake_threads_get)
 
     reddit = ScrapeCreatorsRedditWatcher(
-        "key", ["claude referral"], lookback_minutes=7
+        "key", ["claude referral"], lookback_minutes=7, max_post_age_minutes=180
     )
 
     async def fake_reddit_get(path, *, params=None, source):
-        return _response({
-            "posts": [{
-                "id": "stale-reddit",
-                "subreddit": "ClaudeAI",
-                "author": "old",
-                "created_utc": stale_ts,
-                "permalink": "/r/ClaudeAI/comments/stale/old/",
-                "title": "old",
-                "selftext": "https://claude.ai/referral/old",
-            }]
-        })
+        return _response({"posts": [_reddit_row("stale-reddit", stale, "old")]})
 
     monkeypatch.setattr(reddit.client, "get", fake_reddit_get)
 
@@ -312,3 +318,85 @@ def test_social_watchers_drop_stale_results(monkeypatch):
         assert await reddit.fetch() == []
 
     asyncio.run(run())
+
+
+def test_social_watchers_accept_posts_indexed_after_the_polling_window(monkeypatch):
+    """Polling cadence and staleness ceiling are not the same thing.
+
+    A post older than the polling lookback but inside the max post age was
+    previously discarded, and referral_results was only counted after that gate,
+    so the loss was invisible in the logs.
+    """
+    late = datetime.now(timezone.utc) - timedelta(minutes=45)
+
+    threads = ScrapeCreatorsThreadsWatcher(
+        "key", ["claude referral"], lookback_minutes=7, max_post_age_minutes=180
+    )
+
+    async def fake_threads_get(path, *, params=None, source):
+        return _response({"posts": [_thread_row("late-thread", late, "late-t")]})
+
+    monkeypatch.setattr(threads.client, "get", fake_threads_get)
+
+    reddit = ScrapeCreatorsRedditWatcher(
+        "key", ["claude referral"], lookback_minutes=7, max_post_age_minutes=180
+    )
+
+    async def fake_reddit_get(path, *, params=None, source):
+        return _response({"posts": [_reddit_row("late-reddit", late, "late-r")]})
+
+    monkeypatch.setattr(reddit.client, "get", fake_reddit_get)
+
+    async def run():
+        thread_posts = await threads.fetch()
+        reddit_posts = await reddit.fetch()
+        assert [p.text for p in thread_posts] == [
+            "https://claude.ai/referral/late-t"
+        ]
+        assert "late-r" in reddit_posts[0].text
+
+    asyncio.run(run())
+
+
+def test_social_watchers_reject_rows_without_a_referral_link(monkeypatch):
+    fresh = datetime.now(timezone.utc) - timedelta(minutes=1)
+    threads = ScrapeCreatorsThreadsWatcher("key", ["claude referral"])
+
+    async def fake_get(path, *, params=None, source):
+        return _response({
+            "posts": [{
+                "id": "chatty",
+                "user": {"username": "someone"},
+                "caption": {"text": "I love Claude, ask me for a referral"},
+                "code": "CHAT",
+                "taken_at": int(fresh.timestamp()),
+            }]
+        })
+
+    monkeypatch.setattr(threads.client, "get", fake_get)
+    assert asyncio.run(threads.fetch()) == []
+
+
+def test_threads_search_window_spans_the_day_boundary(monkeypatch):
+    watcher = ScrapeCreatorsThreadsWatcher("key", ["claude referral"])
+    captured = {}
+
+    async def fake_get(path, *, params=None, source):
+        captured.update(params or {})
+        return _response({"posts": []})
+
+    monkeypatch.setattr(watcher.client, "get", fake_get)
+    asyncio.run(watcher.fetch())
+    assert captured["start_date"] < captured["end_date"]
+    assert captured["trim"] == "false"
+
+
+def test_unexpected_provider_envelope_is_reported(monkeypatch, capsys):
+    watcher = ScrapeCreatorsThreadsWatcher("key", ["claude referral"])
+
+    async def fake_get(path, *, params=None, source):
+        return _response({"success": True, "searchResults": []})
+
+    monkeypatch.setattr(watcher.client, "get", fake_get)
+    assert asyncio.run(watcher.fetch()) == []
+    assert "provider_payload_unexpected" in capsys.readouterr().out

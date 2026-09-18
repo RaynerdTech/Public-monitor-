@@ -5,12 +5,13 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from app.config import SOURCE_DIAGNOSTIC_SAMPLES
 from app.core.activity_log import activity
-from app.core.extractor import extract_referral_links, extract_referral_links_from_data
+from app.core.extractor import extract_referral_links_from_data
 from app.services.apify import ApifyClient
 from app.services.runtime_secrets import get_apify_token
 from app.watchers.base import BaseWatcher, SourcePost
-from app.watchers.freshness import is_recent_timestamp
+from app.watchers.candidates import PollDiagnostics, evaluate_candidate
 
 
 def _parse_datetime(value: object) -> datetime | None:
@@ -51,6 +52,9 @@ def instagram_apify_row_to_source_post(row: dict) -> SourcePost | None:
         or row.get("timestamp")
         or row.get("takenAt")
         or row.get("taken_at")
+        or row.get("postedAt")
+        or row.get("createdAt")
+        or row.get("date")
     )
 
     if not url and not caption:
@@ -72,6 +76,7 @@ class ApifyInstagramWatcher(BaseWatcher):
         actor_id: str,
         interval_seconds: int = 900,
         lookback_minutes: int = 17,
+        max_post_age_minutes: int = 360,
         max_results: int = 10,
         content_type: str = "posts_and_reels",
         search_coverage: str = "efficient",
@@ -85,6 +90,7 @@ class ApifyInstagramWatcher(BaseWatcher):
         self.actor_id = actor_id
         self.interval_seconds = max(60, int(interval_seconds))
         self.lookback_minutes = max(1, int(lookback_minutes))
+        self.max_post_age_minutes = max(1, int(max_post_age_minutes))
         self.max_results = max(1, int(max_results))
         self.content_type = content_type
         self.search_coverage = search_coverage
@@ -97,8 +103,13 @@ class ApifyInstagramWatcher(BaseWatcher):
         self._seen: set[str] = set()
 
     def build_input(self, query: str) -> dict:
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.lookback_minutes)
-        today = datetime.now(timezone.utc).date().isoformat()
+        # oldestPostDate/newestPostDate are inclusive calendar dates. Reach back a
+        # day so a post is not excluded by a day-boundary mismatch; minute-level
+        # filtering is applied locally afterwards.
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            minutes=self.lookback_minutes, days=1
+        )
+        today = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
         return {
             "searchQuery": query,
             "resultsLimit": self.max_results,
@@ -110,11 +121,17 @@ class ApifyInstagramWatcher(BaseWatcher):
         }
 
     async def fetch(self) -> list[SourcePost]:
-        activity("source_poll_started", source="Instagram")
+        activity(
+            "source_poll_started",
+            source="Instagram",
+            queries=self.queries,
+            actor=self.actor_id,
+            lookback_minutes=self.lookback_minutes,
+            max_post_age_minutes=self.max_post_age_minutes,
+        )
         posts: list[SourcePost] = []
-        raw_results = 0
-        recent_results = 0
-        referral_results = 0
+        diagnostics = PollDiagnostics("Instagram", sample_limit=SOURCE_DIAGNOSTIC_SAMPLES)
+        rows_without_timestamp = 0
 
         for query in self.queries:
             rows = await self.client.run_actor(
@@ -123,22 +140,42 @@ class ApifyInstagramWatcher(BaseWatcher):
                 source="Instagram",
                 max_items=self.max_results,
             )
-            raw_results += len(rows)
+            diagnostics.record_raw(len(rows))
+            if not rows:
+                # A boolean-search Actor returning nothing is a query problem,
+                # not a filtering problem. Make that explicit in the logs.
+                activity(
+                    "provider_returned_no_rows",
+                    source="Instagram",
+                    query=query,
+                    actor=self.actor_id,
+                    hint="Instagram boolean search matches whole words; avoid URL punctuation",
+                    level="WARNING",
+                )
             for row in rows:
                 post = instagram_apify_row_to_source_post(row)
-                if post is None or not is_recent_timestamp(post.created_at, self.lookback_minutes):
-                    continue
-                recent_results += 1
-                if extract_referral_links(post.text):
-                    referral_results += 1
-                key = post.url or f"{post.created_at}:{post.text[:120]}"
-                if key in self._seen:
-                    continue
-                self._seen.add(key)
-                posts.append(post)
+                if post is not None and post.created_at is None:
+                    rows_without_timestamp += 1
+                key = ""
+                if post is not None:
+                    key = post.url or f"{post.created_at}:{post.text[:120]}"
+                    if key in self._seen:
+                        diagnostics.record_duplicate(key)
+                        continue
+                verdict = evaluate_candidate(
+                    post,
+                    max_post_age_minutes=self.max_post_age_minutes,
+                    lookback_minutes=self.lookback_minutes,
+                )
+                if diagnostics.record(verdict, post, row_id=key) and post is not None:
+                    self._seen.add(key)
+                    posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
-        activity("source_poll_completed", source="Instagram", raw_results=raw_results, recent_results=recent_results, referral_results=referral_results, posts_found=len(posts))
+        diagnostics.completed(
+            posts_found=len(posts),
+            rows_without_timestamp=rows_without_timestamp,
+        )
         return posts
 
     async def stream(self):

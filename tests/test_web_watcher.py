@@ -104,7 +104,15 @@ def test_exa_content_fallback_requests_targeted_links_and_highlights():
     assert captured["json"]["highlights"]["maxCharacters"] == 3000
 
 
-def test_fetch_drops_undated_and_old_results(monkeypatch):
+def test_fetch_drops_old_results_but_inspects_undated_ones(monkeypatch):
+    """Undated pages are inspected; only their content decides.
+
+    Forums and link aggregators - exactly where referral links get posted -
+    frequently expose no publishedDate. Hard-rejecting them before the page was
+    ever read meant broad discovery could never see those links. Nothing is sent
+    unless a real claude.ai/referral/ link is found, and the referral code is
+    de-duplicated in the database.
+    """
     now = datetime.now(timezone.utc)
     fresh = (now - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
     old = (now - timedelta(hours=3)).isoformat().replace("+00:00", "Z")
@@ -129,7 +137,26 @@ def test_fetch_drops_undated_and_old_results(monkeypatch):
     monkeypatch.setattr(watcher, "_fetch_page", fake_fetch)
 
     posts = asyncio.run(watcher.fetch())
-    assert [post.url for post in posts] == ["https://example.com/fresh"]
+    urls = {post.url for post in posts}
+    assert "https://example.com/fresh" in urls
+    assert "https://example.com/undated" in urls
+    # A result Exa itself dated outside the window is still rejected up front.
+    assert "https://example.com/old" not in urls
+
+
+def test_fetch_drops_undated_pages_without_a_referral_link(monkeypatch):
+    watcher = ExaWebWatcher("test-key", ["query"], lookback_minutes=60)
+
+    async def fake_search(_client, _query, _cutoff):
+        return [{"url": "https://example.com/undated"}]
+
+    async def fake_fetch(_client, _url):
+        return "a page that merely mentions Claude referrals in passing"
+
+    monkeypatch.setattr(watcher, "_search", fake_search)
+    monkeypatch.setattr(watcher, "_fetch_page", fake_fetch)
+
+    assert asyncio.run(watcher.fetch()) == []
 
 
 def test_fetch_uses_exa_link_without_fetching_page(monkeypatch):

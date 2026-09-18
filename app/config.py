@@ -22,22 +22,54 @@ REFERRAL_SEARCH_TERM = (
 SEARCH_INCLUDE_BROAD_KEYWORDS = _env_bool("SEARCH_INCLUDE_BROAD_KEYWORDS", False)
 
 
-def _link_focused_queries(env_name: str, broad_default: str) -> list[str]:
-    """Keep paid discovery focused on the referral URL by default.
+def _link_focused_queries(
+    env_name: str,
+    broad_default: str,
+    *,
+    engine_matches_urls: bool = False,
+) -> list[str]:
+    """Build the retrieval query for one provider.
 
-    Existing keyword ENV values are retained only when SEARCH_INCLUDE_BROAD_KEYWORDS=true.
-    This prevents a legacy `claude referral` setting from hiding posts that contain the
-    actual referral URL, while avoiding extra paid queries by default.
+    The referral URL is what we ultimately filter on, but most social search
+    engines tokenize text and cannot match a literal URL such as
+    ``claude.ai/referral``. Sending that string as the *only* query is why
+    Threads and Instagram returned ``raw_results: 0`` while a real public post
+    containing the link existed.
+
+    So: retrieve with a query the engine can actually satisfy, then apply strict
+    ``claude.ai/referral/`` filtering on the returned content (see
+    ``app.watchers.candidates``). Only engines that genuinely index URL-ish
+    tokens get the literal URL term.
+
+    An explicit ENV value always wins, so deployments can override per provider.
+    Exactly one query is used by default to keep paid credit usage flat.
     """
-    broad = [
-        value.strip()
-        for value in os.getenv(env_name, broad_default).split("||")
-        if value.strip()
-    ]
-    if not SEARCH_INCLUDE_BROAD_KEYWORDS:
-        return [REFERRAL_SEARCH_TERM]
-    values = [REFERRAL_SEARCH_TERM, *broad]
-    return list(dict.fromkeys(values))
+    configured = os.getenv(env_name)
+    if configured is not None:
+        values = [value.strip() for value in configured.split("||") if value.strip()]
+        if values:
+            return list(dict.fromkeys(values))
+
+    values = [REFERRAL_SEARCH_TERM] if engine_matches_urls else [broad_default]
+    if SEARCH_INCLUDE_BROAD_KEYWORDS:
+        extra = [REFERRAL_SEARCH_TERM, broad_default, "claude guest pass"]
+        values = [*values, *extra]
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _max_post_age_minutes(env_name: str, default_minutes: int) -> int:
+    """Staleness ceiling for a post that already contains a referral link.
+
+    This is deliberately separate from the polling lookback. Polling cadence
+    controls how often we ask; this controls how late a platform is allowed to
+    surface a post before we consider the link not worth alerting on.
+    """
+    return max(1, int(os.getenv(env_name, str(default_minutes))))
+
+# How many raw provider rows to log in full per poll, so a zero-result poll is
+# explainable from Render logs alone. Rows carrying a referral link that get
+# rejected are ALWAYS logged in full, regardless of this limit.
+SOURCE_DIAGNOSTIC_SAMPLES = max(0, int(os.getenv("SOURCE_DIAGNOSTIC_SAMPLES", "3")))
 
 SCRAPE_CREATORS_API_KEY = os.getenv("SCRAPE_CREATORS_API_KEY", "").strip()
 SCRAPE_CREATORS_TIMEOUT_SECONDS = max(3.0, float(os.getenv("SCRAPE_CREATORS_TIMEOUT_SECONDS", "30")))
@@ -188,7 +220,12 @@ THREADS_WATCH_INTERVAL_SECONDS = max(
 )
 THREADS_LOOKBACK_MINUTES = max(1, int(os.getenv("THREADS_LOOKBACK_MINUTES", "7")))
 THREADS_SEARCH_LIMIT = min(100, max(1, int(os.getenv("THREADS_SEARCH_LIMIT", "50"))))
-THREADS_QUERIES = _link_focused_queries("THREADS_QUERIES", "claude referral")
+THREADS_MAX_POST_AGE_MINUTES = _max_post_age_minutes("THREADS_MAX_POST_AGE_MINUTES", 180)
+# Threads keyword search does not match literal URLs, so retrieve on keywords
+# and filter strictly for claude.ai/referral/ afterwards.
+THREADS_QUERIES = _link_focused_queries(
+    "THREADS_QUERIES", "claude referral", engine_matches_urls=False
+)
 
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "").strip()
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
@@ -201,7 +238,11 @@ REDDIT_WATCH_INTERVAL_SECONDS = max(
 )
 REDDIT_LOOKBACK_MINUTES = max(1, int(os.getenv("REDDIT_LOOKBACK_MINUTES", "7")))
 REDDIT_SEARCH_LIMIT = min(100, max(1, int(os.getenv("REDDIT_SEARCH_LIMIT", "100"))))
-REDDIT_QUERIES = _link_focused_queries("REDDIT_QUERIES", "claude referral")
+REDDIT_MAX_POST_AGE_MINUTES = _max_post_age_minutes("REDDIT_MAX_POST_AGE_MINUTES", 180)
+# Reddit search does index link targets, and this query already returns rows.
+REDDIT_QUERIES = _link_focused_queries(
+    "REDDIT_QUERIES", "claude referral", engine_matches_urls=True
+)
 
 REDDIT_SCRAPE_FILTER = os.getenv("REDDIT_SCRAPE_FILTER", "posts").strip().lower() or "posts"
 REDDIT_SCRAPE_TIMEFRAME = os.getenv("REDDIT_SCRAPE_TIMEFRAME", "day").strip().lower() or "day"
@@ -210,7 +251,11 @@ INSTAGRAM_WATCH_INTERVAL_SECONDS = max(
     60, int(os.getenv("INSTAGRAM_WATCH_INTERVAL_SECONDS", "900"))
 )
 INSTAGRAM_LOOKBACK_MINUTES = max(1, int(os.getenv("INSTAGRAM_LOOKBACK_MINUTES", "17")))
-INSTAGRAM_QUERIES = _link_focused_queries("INSTAGRAM_QUERIES", "claude referral")
+INSTAGRAM_MAX_POST_AGE_MINUTES = _max_post_age_minutes("INSTAGRAM_MAX_POST_AGE_MINUTES", 360)
+# The boolean-search Actor matches on whole words and discourages punctuation.
+INSTAGRAM_QUERIES = _link_focused_queries(
+    "INSTAGRAM_QUERIES", "claude referral", engine_matches_urls=False
+)
 INSTAGRAM_SEARCH_LIMIT = min(100, max(1, int(os.getenv("INSTAGRAM_SEARCH_LIMIT", "10"))))
 INSTAGRAM_CONTENT_TYPE = os.getenv("INSTAGRAM_CONTENT_TYPE", "posts_and_reels").strip() or "posts_and_reels"
 INSTAGRAM_SEARCH_COVERAGE = os.getenv("INSTAGRAM_SEARCH_COVERAGE", "efficient").strip() or "efficient"
@@ -220,7 +265,11 @@ FACEBOOK_WATCH_INTERVAL_SECONDS = max(
     60, int(os.getenv("FACEBOOK_WATCH_INTERVAL_SECONDS", "600"))
 )
 FACEBOOK_LOOKBACK_MINUTES = max(1, int(os.getenv("FACEBOOK_LOOKBACK_MINUTES", "12")))
-FACEBOOK_QUERIES = _link_focused_queries("FACEBOOK_QUERIES", "claude referral")
+FACEBOOK_MAX_POST_AGE_MINUTES = _max_post_age_minutes("FACEBOOK_MAX_POST_AGE_MINUTES", 360)
+# Facebook post search is keyword based; the literal URL returns nothing useful.
+FACEBOOK_QUERIES = _link_focused_queries(
+    "FACEBOOK_QUERIES", "claude referral", engine_matches_urls=False
+)
 FACEBOOK_SEARCH_LIMIT = min(100, max(1, int(os.getenv("FACEBOOK_SEARCH_LIMIT", "10"))))
 FACEBOOK_PAGE_DELAY_MS = max(0, int(os.getenv("FACEBOOK_PAGE_DELAY_MS", "800")))
 
@@ -238,7 +287,7 @@ YOUTUBE_QUERIES = [
     query.strip()
     for query in os.getenv(
         "YOUTUBE_QUERIES",
-        "claude.ai/referral|claude referral|claude guest pass",
+        '"claude referral"|"claude guest pass"|"claude.ai/referral"',
     ).split("||")
     if query.strip()
 ]
@@ -275,8 +324,11 @@ WEB_DIRECT_SOURCES = [
 WEB_DIRECT_WATCH_INTERVAL_SECONDS = max(
     30, int(os.getenv("WEB_DIRECT_WATCH_INTERVAL_SECONDS", "120"))
 )
+# Sitemaps are usually cached for several minutes and <lastmod> is the page's
+# modification time, not our discovery time. A 5-minute window meant a new post
+# was already "too old" by the time the regenerated sitemap was served.
 WEB_DIRECT_LOOKBACK_MINUTES = max(
-    5, int(os.getenv("WEB_DIRECT_LOOKBACK_MINUTES", "5"))
+    5, int(os.getenv("WEB_DIRECT_LOOKBACK_MINUTES", "120"))
 )
 WEB_DIRECT_TIMEOUT_SECONDS = max(
     3, int(os.getenv("WEB_DIRECT_TIMEOUT_SECONDS", "15"))

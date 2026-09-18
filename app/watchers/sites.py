@@ -152,12 +152,13 @@ class DirectWebsiteWatcher(BaseWatcher):
         self._seen_undated_pages: set[str] = set()
         self._seen_referrals_by_url: dict[str, frozenset[str]] = {}
 
-    def _conditional_headers(self, url: str) -> dict[str, str]:
+    def _conditional_headers(self, url: str, *, conditional: bool = True) -> dict[str, str]:
         headers = {
-            "User-Agent": "ReferralMonitor/10.3 (+direct feed and sitemap watcher)",
+            "User-Agent": "ReferralMonitor/10.7 (+direct feed and sitemap watcher)",
             "Accept": "application/rss+xml,application/atom+xml,application/xml,text/xml,text/html,*/*",
         }
-        headers.update(self._validators.get(url, {}))
+        if conditional:
+            headers.update(self._validators.get(url, {}))
         return headers
 
     def _remember_validators(self, url: str, response: httpx.Response) -> None:
@@ -169,15 +170,41 @@ class DirectWebsiteWatcher(BaseWatcher):
         if values:
             self._validators[url] = values
 
-    async def _get(self, client: httpx.AsyncClient, url: str) -> httpx.Response | None:
+    async def _get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        conditional: bool = True,
+    ) -> httpx.Response | None:
+        """Fetch one URL.
+
+        Discovery documents (feeds and sitemaps) are fetched unconditionally.
+        Sending If-None-Match/If-Modified-Since for them meant a cached 304 from
+        the origin or its CDN skipped parsing entirely, so the sitemap was
+        counted as polled while contributing zero page candidates - exactly the
+        "sitemaps_polled: 7, pages_fetched: 0" symptom. Conditional requests are
+        still used for the much larger page bodies, where they actually save
+        bandwidth.
+        """
         try:
-            response = await client.get(url, headers=self._conditional_headers(url))
+            response = await client.get(
+                url, headers=self._conditional_headers(url, conditional=conditional)
+            )
             if response.status_code == 304:
                 return response
             response.raise_for_status()
-            self._remember_validators(url, response)
+            if conditional:
+                self._remember_validators(url, response)
             return response
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            activity(
+                "web_direct_fetch_failed",
+                source="Web / Direct",
+                target_url=url,
+                error_type=type(exc).__name__,
+                level="WARNING",
+            )
             return None
 
     def _append_if_new(self, posts: list[SourcePost], post: SourcePost) -> bool:
@@ -213,11 +240,16 @@ class DirectWebsiteWatcher(BaseWatcher):
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
             semaphore = asyncio.Semaphore(8)
 
-            async def fetch_endpoint(url: str) -> tuple[str, httpx.Response | None]:
+            async def fetch_endpoint(
+                url: str, *, conditional: bool = True
+            ) -> tuple[str, httpx.Response | None]:
                 async with semaphore:
-                    return url, await self._get(client, url)
+                    return url, await self._get(client, url, conditional=conditional)
 
-            responses = await asyncio.gather(*(fetch_endpoint(url) for url in endpoints))
+            async def fetch_discovery(url: str) -> tuple[str, httpx.Response | None]:
+                return await fetch_endpoint(url, conditional=False)
+
+            responses = await asyncio.gather(*(fetch_discovery(url) for url in endpoints))
             for url, response in responses:
                 if response is None or response.status_code == 304:
                     continue
@@ -244,7 +276,7 @@ class DirectWebsiteWatcher(BaseWatcher):
                 dict.fromkeys(child_sitemaps),
                 key=lambda url: ("post" not in url.lower() and "blog" not in url.lower(), url),
             )[:10]
-            child_responses = await asyncio.gather(*(fetch_endpoint(url) for url in preferred))
+            child_responses = await asyncio.gather(*(fetch_discovery(url) for url in preferred))
             for _url, response in child_responses:
                 if response is None or response.status_code == 304:
                     continue
@@ -259,17 +291,32 @@ class DirectWebsiteWatcher(BaseWatcher):
                     unique_candidates[url] = modified
 
             fresh_pages: list[tuple[str, datetime | None]] = []
+            dated_candidates = 0
+            dated_too_old = 0
+            undated_candidates = 0
+            undated_bootstrapped = 0
+            undated_new = 0
+            newest_lastmod: datetime | None = None
             for url, modified in unique_candidates.items():
                 if modified is not None:
+                    dated_candidates += 1
+                    if newest_lastmod is None or modified > newest_lastmod:
+                        newest_lastmod = modified
                     if modified >= cutoff:
                         fresh_pages.append((url, modified))
+                    else:
+                        dated_too_old += 1
                     continue
+                undated_candidates += 1
                 # Undated sitemap history is bootstrapped silently. Only URLs that
                 # appear for the first time after bootstrap are fetched.
                 if url not in self._seen_undated_pages:
                     self._seen_undated_pages.add(url)
                     if self._bootstrapped:
+                        undated_new += 1
                         fresh_pages.append((url, None))
+                    else:
+                        undated_bootstrapped += 1
 
             fresh_pages.sort(
                 key=lambda item: item[1] or datetime.min.replace(tzinfo=timezone.utc),
@@ -301,9 +348,20 @@ class DirectWebsiteWatcher(BaseWatcher):
             "source_poll_completed",
             source="Web / Direct",
             configured_sources=len(self.sources),
+            endpoints_probed=len(endpoints),
             feeds_polled=feeds_polled,
             sitemaps_polled=sitemaps_polled,
+            child_sitemaps_seen=len(set(child_sitemaps)),
+            page_candidates=len(unique_candidates),
+            dated_candidates=dated_candidates,
+            dated_rejected_too_old=dated_too_old,
+            undated_candidates=undated_candidates,
+            undated_bootstrapped=undated_bootstrapped,
+            undated_new=undated_new,
+            pages_selected=len(fresh_pages),
             pages_fetched=pages_fetched,
+            lookback_minutes=self.lookback_minutes,
+            newest_sitemap_lastmod=newest_lastmod,
             posts_found=len(posts),
         )
         return posts

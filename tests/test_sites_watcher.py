@@ -65,7 +65,7 @@ async def test_direct_watcher_finds_recent_unindexed_sitemap_page(monkeypatch):
         f"<lastmod>{now}</lastmod></url></urlset>"
     )
 
-    async def fake_get(_client, url):
+    async def fake_get(_client, url, **_kwargs):
         if url.endswith("/sitemap.xml"):
             return httpx.Response(
                 200, text=sitemap, headers={"content-type": "application/xml"}
@@ -96,7 +96,7 @@ async def test_direct_watcher_deduplicates_same_feed_referral(monkeypatch):
     <description>https://claude.ai/referral/feed-code</description>
     </item></channel></rss>"""
 
-    async def fake_get(_client, _url):
+    async def fake_get(_client, _url, **_kwargs):
         return httpx.Response(
             200, text=feed, headers={"content-type": "application/rss+xml"}
         )

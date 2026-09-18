@@ -5,11 +5,12 @@ from datetime import datetime, timezone
 
 import httpx
 
+from app.config import SOURCE_DIAGNOSTIC_SAMPLES
 from app.core.activity_log import activity
-from app.core.extractor import extract_referral_links, extract_referral_links_from_data
+from app.core.extractor import extract_referral_links_from_data
 from app.services.scrape_creators import ScrapeCreatorsClient
 from app.watchers.base import BaseWatcher, SourcePost
-from app.watchers.freshness import is_recent_timestamp
+from app.watchers.candidates import PollDiagnostics, evaluate_candidate
 from app.watchers.reddit import parse_reddit_timestamp, reddit_row_to_source_post
 
 
@@ -28,6 +29,7 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
         search_filter: str = "posts",
         timeframe: str = "day",
         lookback_minutes: int = 7,
+        max_post_age_minutes: int = 180,
         timeout_seconds: float = 30.0,
     ) -> None:
         self.queries = [query.strip() for query in queries if query.strip()]
@@ -41,6 +43,7 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
         self.search_filter = search_filter
         self.timeframe = timeframe
         self.lookback_minutes = max(1, int(lookback_minutes))
+        self.max_post_age_minutes = max(1, int(max_post_age_minutes))
         self.client = ScrapeCreatorsClient(api_key, timeout_seconds=timeout_seconds)
         self._seen_post_ids: set[str] = set()
 
@@ -57,8 +60,17 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
             source="Reddit",
         )
         key = "posts" if self.search_filter == "posts" else "comments"
-        rows = result.payload.get(key, [])
-        return rows if isinstance(rows, list) else []
+        rows = result.payload.get(key)
+        if isinstance(rows, list):
+            return rows
+        activity(
+            "provider_payload_unexpected",
+            source="Reddit",
+            expected_key=key,
+            payload_keys=sorted(result.payload.keys())[:20],
+            level="WARNING",
+        )
+        return []
 
     @staticmethod
     def _comment_to_source_post(row: dict) -> SourcePost | None:
@@ -83,26 +95,39 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
             source=":".join(str(bit) for bit in source_bits),
             text=body,
             url=source_url,
-            created_at=parse_reddit_timestamp(row.get("created_utc") or row.get("created")),
+            created_at=parse_reddit_timestamp(
+                row.get("created_utc") or row.get("created") or row.get("created_at_iso")
+            ),
         )
 
     async def fetch(self) -> list[SourcePost]:
-        activity("source_poll_started", source="Reddit")
+        activity(
+            "source_poll_started",
+            source="Reddit",
+            queries=self.queries,
+            timeframe=self.timeframe,
+            lookback_minutes=self.lookback_minutes,
+            max_post_age_minutes=self.max_post_age_minutes,
+        )
         posts: list[SourcePost] = []
-        raw_results = 0
-        recent_results = 0
-        referral_results = 0
+        diagnostics = PollDiagnostics("Reddit", sample_limit=SOURCE_DIAGNOSTIC_SAMPLES)
 
         for query in self.queries:
             rows = await self._search(query)
-            raw_results += len(rows)
+            diagnostics.record_raw(len(rows))
             for row in rows:
                 if not isinstance(row, dict):
+                    diagnostics.record(
+                        evaluate_candidate(None, max_post_age_minutes=self.max_post_age_minutes),
+                        None,
+                    )
                     continue
                 row_id = str(row.get("id") or row.get("name") or row.get("post_id") or "").strip()
-                if not row_id or row_id in self._seen_post_ids:
+                if row_id and row_id in self._seen_post_ids:
+                    diagnostics.record_duplicate(row_id)
                     continue
-                self._seen_post_ids.add(row_id)
+                if row_id:
+                    self._seen_post_ids.add(row_id)
                 if self.search_filter == "comments":
                     post = self._comment_to_source_post(row)
                 else:
@@ -111,16 +136,16 @@ class ScrapeCreatorsRedditWatcher(BaseWatcher):
                     nested_referrals = extract_referral_links_from_data(row)
                     if nested_referrals:
                         post.text = "\n".join(part for part in [post.text, *nested_referrals] if part)
-                if post is not None and is_recent_timestamp(
-                    post.created_at, self.lookback_minutes
-                ):
-                    recent_results += 1
-                    if extract_referral_links(post.text):
-                        referral_results += 1
+                verdict = evaluate_candidate(
+                    post,
+                    max_post_age_minutes=self.max_post_age_minutes,
+                    lookback_minutes=self.lookback_minutes,
+                )
+                if diagnostics.record(verdict, post, row_id=row_id) and post is not None:
                     posts.append(post)
 
         posts.sort(key=lambda post: post.created_at or datetime.min.replace(tzinfo=timezone.utc))
-        activity("source_poll_completed", source="Reddit", raw_results=raw_results, recent_results=recent_results, referral_results=referral_results, posts_found=len(posts))
+        diagnostics.completed(posts_found=len(posts))
         return posts
 
     async def stream(self):

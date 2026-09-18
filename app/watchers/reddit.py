@@ -13,11 +13,24 @@ REDDIT_SEARCH_URL = "https://oauth.reddit.com/search"
 
 
 def parse_reddit_timestamp(value: object) -> datetime | None:
-    try:
-        timestamp = float(value)
-    except (TypeError, ValueError):
+    """Parse an epoch value, or an ISO string such as ``created_at_iso``."""
+    if value is None:
         return None
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def reddit_row_to_source_post(row: dict) -> SourcePost | None:

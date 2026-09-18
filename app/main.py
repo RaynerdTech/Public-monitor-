@@ -50,6 +50,7 @@ from app.config import (
     REDDIT_USER_AGENT,
     REDDIT_WATCH_INTERVAL_SECONDS,
     REDDIT_LOOKBACK_MINUTES,
+    REDDIT_MAX_POST_AGE_MINUTES,
     REDDIT_SCRAPE_FILTER,
     REDDIT_SCRAPE_TIMEFRAME,
     THREADS_ACCESS_TOKEN,
@@ -70,6 +71,7 @@ from app.config import (
     THREADS_SEARCH_LIMIT,
     THREADS_WATCH_INTERVAL_SECONDS,
     THREADS_LOOKBACK_MINUTES,
+    THREADS_MAX_POST_AGE_MINUTES,
     APIFY_API_TOKEN,
     APIFY_TIMEOUT_SECONDS,
     APIFY_MAX_RUN_COST_USD,
@@ -81,6 +83,7 @@ from app.config import (
     TELEGRAM_ADMIN_CHAT_IDS,
     INSTAGRAM_WATCH_INTERVAL_SECONDS,
     INSTAGRAM_LOOKBACK_MINUTES,
+    INSTAGRAM_MAX_POST_AGE_MINUTES,
     INSTAGRAM_QUERIES,
     INSTAGRAM_SEARCH_LIMIT,
     INSTAGRAM_CONTENT_TYPE,
@@ -88,6 +91,7 @@ from app.config import (
     INSTAGRAM_HASHTAG_FEED_TYPE,
     FACEBOOK_WATCH_INTERVAL_SECONDS,
     FACEBOOK_LOOKBACK_MINUTES,
+    FACEBOOK_MAX_POST_AGE_MINUTES,
     FACEBOOK_QUERIES,
     FACEBOOK_SEARCH_LIMIT,
     FACEBOOK_PAGE_DELAY_MS,
@@ -155,7 +159,7 @@ from app.watchers.x import XFilteredStreamWatcher, XWatcher
 
 cli = typer.Typer(no_args_is_help=True)
 console = Console()
-APP_VERSION = "10.7.2"
+APP_VERSION = "10.8.0"
 _threads_persistence_lock = threading.Lock()
 
 
@@ -925,6 +929,7 @@ def threads_test(
             queries,
             interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
             lookback_minutes=THREADS_LOOKBACK_MINUTES,
+            max_post_age_minutes=THREADS_MAX_POST_AGE_MINUTES,
             timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
 
@@ -981,6 +986,7 @@ def watch_threads(
             THREADS_QUERIES,
             interval_seconds=interval,
             lookback_minutes=THREADS_LOOKBACK_MINUTES,
+            max_post_age_minutes=THREADS_MAX_POST_AGE_MINUTES,
             timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
         console.print(
@@ -1025,6 +1031,7 @@ def reddit_test(
             search_filter=REDDIT_SCRAPE_FILTER,
             timeframe=REDDIT_SCRAPE_TIMEFRAME,
             lookback_minutes=REDDIT_LOOKBACK_MINUTES,
+            max_post_age_minutes=REDDIT_MAX_POST_AGE_MINUTES,
             timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
 
@@ -1083,6 +1090,7 @@ def watch_reddit(
             search_filter=REDDIT_SCRAPE_FILTER,
             timeframe=REDDIT_SCRAPE_TIMEFRAME,
             lookback_minutes=REDDIT_LOOKBACK_MINUTES,
+            max_post_age_minutes=REDDIT_MAX_POST_AGE_MINUTES,
             timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
         )
         console.print(
@@ -1118,6 +1126,7 @@ def instagram_test(
             actor_id=APIFY_INSTAGRAM_ACTOR_ID,
             interval_seconds=INSTAGRAM_WATCH_INTERVAL_SECONDS,
             lookback_minutes=INSTAGRAM_LOOKBACK_MINUTES,
+            max_post_age_minutes=INSTAGRAM_MAX_POST_AGE_MINUTES,
             max_results=INSTAGRAM_SEARCH_LIMIT,
             content_type=INSTAGRAM_CONTENT_TYPE,
             search_coverage=INSTAGRAM_SEARCH_COVERAGE,
@@ -1174,6 +1183,7 @@ def watch_instagram(
             actor_id=APIFY_INSTAGRAM_ACTOR_ID,
             interval_seconds=interval,
             lookback_minutes=INSTAGRAM_LOOKBACK_MINUTES,
+            max_post_age_minutes=INSTAGRAM_MAX_POST_AGE_MINUTES,
             max_results=INSTAGRAM_SEARCH_LIMIT,
             content_type=INSTAGRAM_CONTENT_TYPE,
             search_coverage=INSTAGRAM_SEARCH_COVERAGE,
@@ -1213,6 +1223,7 @@ def facebook_test(
             actor_id=APIFY_FACEBOOK_ACTOR_ID,
             interval_seconds=FACEBOOK_WATCH_INTERVAL_SECONDS,
             lookback_minutes=FACEBOOK_LOOKBACK_MINUTES,
+            max_post_age_minutes=FACEBOOK_MAX_POST_AGE_MINUTES,
             max_results=FACEBOOK_SEARCH_LIMIT,
             page_delay_ms=FACEBOOK_PAGE_DELAY_MS,
             timeout_seconds=APIFY_TIMEOUT_SECONDS,
@@ -1267,6 +1278,7 @@ def watch_facebook(
             actor_id=APIFY_FACEBOOK_ACTOR_ID,
             interval_seconds=interval,
             lookback_minutes=FACEBOOK_LOOKBACK_MINUTES,
+            max_post_age_minutes=FACEBOOK_MAX_POST_AGE_MINUTES,
             max_results=FACEBOOK_SEARCH_LIMIT,
             page_delay_ms=FACEBOOK_PAGE_DELAY_MS,
             timeout_seconds=APIFY_TIMEOUT_SECONDS,
@@ -2275,6 +2287,7 @@ def watch_all() -> None:
                 THREADS_QUERIES,
                 interval_seconds=THREADS_WATCH_INTERVAL_SECONDS,
                 lookback_minutes=THREADS_LOOKBACK_MINUTES,
+                max_post_age_minutes=THREADS_MAX_POST_AGE_MINUTES,
                 timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
             )
             tasks.append(
@@ -2299,6 +2312,7 @@ def watch_all() -> None:
                 search_filter=REDDIT_SCRAPE_FILTER,
                 timeframe=REDDIT_SCRAPE_TIMEFRAME,
                 lookback_minutes=REDDIT_LOOKBACK_MINUTES,
+                max_post_age_minutes=REDDIT_MAX_POST_AGE_MINUTES,
                 timeout_seconds=SCRAPE_CREATORS_TIMEOUT_SECONDS,
             )
             tasks.append(
@@ -2321,6 +2335,7 @@ def watch_all() -> None:
                 actor_id=APIFY_INSTAGRAM_ACTOR_ID,
                 interval_seconds=INSTAGRAM_WATCH_INTERVAL_SECONDS,
                 lookback_minutes=INSTAGRAM_LOOKBACK_MINUTES,
+                max_post_age_minutes=INSTAGRAM_MAX_POST_AGE_MINUTES,
                 max_results=INSTAGRAM_SEARCH_LIMIT,
                 content_type=INSTAGRAM_CONTENT_TYPE,
                 search_coverage=INSTAGRAM_SEARCH_COVERAGE,
@@ -2348,6 +2363,7 @@ def watch_all() -> None:
                 actor_id=APIFY_FACEBOOK_ACTOR_ID,
                 interval_seconds=FACEBOOK_WATCH_INTERVAL_SECONDS,
                 lookback_minutes=FACEBOOK_LOOKBACK_MINUTES,
+                max_post_age_minutes=FACEBOOK_MAX_POST_AGE_MINUTES,
                 max_results=FACEBOOK_SEARCH_LIMIT,
                 page_delay_ms=FACEBOOK_PAGE_DELAY_MS,
                 timeout_seconds=APIFY_TIMEOUT_SECONDS,
@@ -2553,6 +2569,7 @@ def status() -> None:
     table.add_row("Threads / Scrape Creators", "yes" if _threads_configured() else "no")
     table.add_row("Threads interval", f"{THREADS_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Threads lookback", f"{THREADS_LOOKBACK_MINUTES} min")
+    table.add_row("Threads max post age", f"{THREADS_MAX_POST_AGE_MINUTES} min")
     table.add_row("Threads queries", " | ".join(THREADS_QUERIES) or "-")
     table.add_row(
         "Threads est. requests / 30d",
@@ -2562,6 +2579,7 @@ def status() -> None:
     table.add_row("Reddit / Scrape Creators", "yes" if _reddit_configured() else "no")
     table.add_row("Reddit interval", f"{REDDIT_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Reddit lookback", f"{REDDIT_LOOKBACK_MINUTES} min")
+    table.add_row("Reddit max post age", f"{REDDIT_MAX_POST_AGE_MINUTES} min")
     table.add_row("Reddit queries", " | ".join(REDDIT_QUERIES) or "-")
     table.add_row("Reddit search mode", f"{REDDIT_SCRAPE_FILTER} / new / {REDDIT_SCRAPE_TIMEFRAME}")
     table.add_row(
@@ -2572,6 +2590,7 @@ def status() -> None:
     table.add_row("Instagram / Apify", "yes" if _instagram_configured() else "no")
     table.add_row("Instagram interval", f"{INSTAGRAM_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Instagram lookback", f"{INSTAGRAM_LOOKBACK_MINUTES} min")
+    table.add_row("Instagram max post age", f"{INSTAGRAM_MAX_POST_AGE_MINUTES} min")
     table.add_row("Instagram queries", " | ".join(INSTAGRAM_QUERIES) or "-")
     table.add_row("Instagram Actor", APIFY_INSTAGRAM_ACTOR_ID)
     table.add_row("Instagram est. runs / 30d", str(apify_runs_instagram))
@@ -2579,6 +2598,7 @@ def status() -> None:
     table.add_row("Facebook / Apify", "yes" if _facebook_configured() else "no")
     table.add_row("Facebook interval", f"{FACEBOOK_WATCH_INTERVAL_SECONDS}s")
     table.add_row("Facebook lookback", f"{FACEBOOK_LOOKBACK_MINUTES} min")
+    table.add_row("Facebook max post age", f"{FACEBOOK_MAX_POST_AGE_MINUTES} min")
     table.add_row("Facebook queries", " | ".join(FACEBOOK_QUERIES) or "-")
     table.add_row("Facebook Actor", APIFY_FACEBOOK_ACTOR_ID)
     table.add_row("Facebook est. runs / 30d", str(apify_runs_facebook))

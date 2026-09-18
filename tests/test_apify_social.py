@@ -31,7 +31,13 @@ def test_facebook_apify_row_maps_public_post():
     assert post.created_at == datetime(2026, 9, 16, 14, 30, tzinfo=timezone.utc)
 
 
-def test_facebook_apify_input_is_posts_search_with_cost_control_date():
+def test_facebook_apify_input_matches_the_actor_input_schema():
+    """memo23~facebook-search-scraper accepts only these keys.
+
+    It has no date filter. The previously sent onlyPostsNewerThan belonged to a
+    different Actor and was silently ignored, so freshness must be enforced
+    locally instead.
+    """
     watcher = ApifyFacebookWatcher(
         ["claude referral"],
         actor_id="memo23~facebook-search-scraper",
@@ -41,7 +47,14 @@ def test_facebook_apify_input_is_posts_search_with_cost_control_date():
     assert payload["searchType"] == "posts"
     assert payload["searchQueries"] == ["claude referral"]
     assert payload["maxItems"] == 10
-    assert payload["onlyPostsNewerThan"]
+    assert "onlyPostsNewerThan" not in payload
+    assert set(payload) <= {
+        "searchType",
+        "searchQueries",
+        "maxItems",
+        "pageDelayMs",
+        "proxy",
+    }
 
 
 def test_instagram_apify_row_maps_post_or_reel():

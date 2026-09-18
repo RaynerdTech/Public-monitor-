@@ -261,6 +261,9 @@ class ExaWebWatcher(BaseWatcher):
         future_tolerance = now + timedelta(minutes=10)
         candidates: list[dict] = []
         candidate_urls: set[str] = set()
+        raw_results = 0
+        undated_candidates = 0
+        rejected_out_of_window = 0
 
         headers = {
             "x-api-key": self.api_key,
@@ -273,19 +276,25 @@ class ExaWebWatcher(BaseWatcher):
         async with httpx.AsyncClient(timeout=exa_timeout, headers=headers) as exa_client:
             for query in self.queries:
                 rows = await self._search(exa_client, query, cutoff)
+                raw_results += len(rows)
                 for row in rows:
                     url = str(row.get("url") or "").strip()
                     if not url or url in candidate_urls:
                         continue
 
                     published_at = parse_exa_timestamp(row.get("publishedDate"))
-                    # Broad discovery must be demonstrably recent. Undated pages are
-                    # no longer accepted because they are the main source of stale
-                    # results. Useful known domains can be promoted to direct watchers.
+                    # Link-first: an undated page is still worth inspecting, but
+                    # only its content decides. Nothing reaches Telegram unless a
+                    # real claude.ai/referral/ link is found, and the referral code
+                    # is de-duplicated in the database, so undated pages cannot
+                    # produce stale repeat alerts.
                     if published_at is None:
-                        self._status(f"Skipping undated broad web result: {url}")
+                        undated_candidates += 1
+                        candidate_urls.add(url)
+                        candidates.append(row)
                         continue
                     if published_at < cutoff or published_at > future_tolerance:
+                        rejected_out_of_window += 1
                         continue
 
                     candidate_urls.add(url)
@@ -392,6 +401,10 @@ class ExaWebWatcher(BaseWatcher):
         activity(
             "source_poll_completed",
             source="Web / Exa",
+            queries=self.queries,
+            raw_results=raw_results,
+            undated_candidates=undated_candidates,
+            rejected_out_of_window=rejected_out_of_window,
             candidates=len(candidates),
             posts_found=len(posts),
             search_metadata_hits=search_metadata_hits,

@@ -6,21 +6,46 @@ import app.config as config
 import app.services.credit_monitor as cm
 
 
-def test_paid_social_search_defaults_to_referral_domain(monkeypatch):
-    monkeypatch.setenv("THREADS_QUERIES", "claude referral")
+def test_url_capable_engines_get_the_literal_referral_term(monkeypatch):
+    monkeypatch.delenv("REDDIT_QUERIES", raising=False)
     monkeypatch.setattr(config, "SEARCH_INCLUDE_BROAD_KEYWORDS", False)
-    assert config._link_focused_queries("THREADS_QUERIES", "claude referral") == [
-        "claude.ai/referral"
-    ]
+    assert config._link_focused_queries(
+        "REDDIT_QUERIES", "claude referral", engine_matches_urls=True
+    ) == ["claude.ai/referral"]
+
+
+def test_keyword_only_engines_never_get_a_bare_url(monkeypatch):
+    """Threads/Instagram/Facebook search cannot match a literal URL.
+
+    Sending one returned raw_results: 0 in production even though a public post
+    containing the referral link existed.
+    """
+    monkeypatch.delenv("THREADS_QUERIES", raising=False)
+    monkeypatch.setattr(config, "SEARCH_INCLUDE_BROAD_KEYWORDS", False)
+    queries = config._link_focused_queries(
+        "THREADS_QUERIES", "claude referral", engine_matches_urls=False
+    )
+    assert queries == ["claude referral"]
+    assert not any("claude.ai/referral" in query for query in queries)
+
+
+def test_explicit_env_queries_always_win(monkeypatch):
+    monkeypatch.setenv("THREADS_QUERIES", "custom one||custom two||custom one")
+    monkeypatch.setattr(config, "SEARCH_INCLUDE_BROAD_KEYWORDS", False)
+    assert config._link_focused_queries(
+        "THREADS_QUERIES", "claude referral", engine_matches_urls=False
+    ) == ["custom one", "custom two"]
 
 
 def test_broad_keywords_are_optional_and_deduped(monkeypatch):
-    monkeypatch.setenv("THREADS_QUERIES", "claude referral||claude.ai/referral")
+    monkeypatch.delenv("THREADS_QUERIES", raising=False)
     monkeypatch.setattr(config, "SEARCH_INCLUDE_BROAD_KEYWORDS", True)
-    assert config._link_focused_queries("THREADS_QUERIES", "claude referral") == [
-        "claude.ai/referral",
-        "claude referral",
-    ]
+    queries = config._link_focused_queries(
+        "THREADS_QUERIES", "claude referral", engine_matches_urls=False
+    )
+    assert queries[0] == "claude referral"
+    assert "claude.ai/referral" in queries
+    assert len(queries) == len(set(queries))
 
 
 def test_credit_status_includes_all_sources(monkeypatch):
